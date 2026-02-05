@@ -38,9 +38,8 @@ func (s *Server) Start() error {
 
 	// Agent endpoints
 	mux.HandleFunc("POST /api/v1/chat", s.handleChat)
+	// Memories are read-only - only the otter agent can create/modify them
 	mux.HandleFunc("GET /api/v1/memories", s.handleListMemories)
-	mux.HandleFunc("POST /api/v1/memories", s.handleCreateMemory)
-	mux.HandleFunc("DELETE /api/v1/memories/{id}", s.handleDeleteMemory)
 
 	// Governance endpoints
 	mux.HandleFunc("GET /api/v1/governance/rules", s.handleListRules)
@@ -121,54 +120,8 @@ func (s *Server) handleListMemories(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, memories)
 }
 
-// handleCreateMemory handles creating a memory
-func (s *Server) handleCreateMemory(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Content    string  `json:"content"`
-		Type       string  `json:"type"`
-		Importance float32 `json:"importance"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	// Generate embedding (placeholder - should use LLM)
-	embedding := make([]float32, 384)
-
-	record := &memory.MemoryRecord{
-		Type:       memory.MemoryType(req.Type),
-		Content:    req.Content,
-		Embedding:  embedding,
-		Importance: req.Importance,
-	}
-
-	if err := s.agent.GetMemory().Store(r.Context(), record); err != nil {
-		respondError(w, http.StatusInternalServerError, "failed to store memory")
-		return
-	}
-
-	respondJSON(w, http.StatusCreated, map[string]string{
-		"id": record.ID,
-	})
-}
-
-// handleDeleteMemory handles deleting a memory
-func (s *Server) handleDeleteMemory(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	memType := r.URL.Query().Get("type")
-	if memType == "" {
-		memType = string(memory.MemoryTypeLongTerm)
-	}
-
-	if err := s.agent.GetMemory().Delete(r.Context(), id, memory.MemoryType(memType)); err != nil {
-		respondError(w, http.StatusInternalServerError, "failed to delete memory")
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
+// Memories and musings can only be created/modified by the otter agent internally.
+// No public API endpoints are provided for creating or deleting memories.
 
 // handleListRules handles listing active governance rules
 func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {

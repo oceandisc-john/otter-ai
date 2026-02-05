@@ -124,9 +124,9 @@ Required configuration:
 - `POST /api/v1/chat` - Send a message
 
 ### Memory
-- `GET /api/v1/memories` - List memories
-- `POST /api/v1/memories` - Create a memory
-- `DELETE /api/v1/memories/{id}` - Delete a memory
+- `GET /api/v1/memories` - List memories (read-only)
+
+**Note**: Memories and musings can only be created and modified by the Otter agent internally. No public API endpoints are provided for creating or deleting memories to ensure the agent maintains full control over its own memory and reflection processes.
 
 ### Governance
 - `GET /api/v1/governance/rules` - List active rules
@@ -199,7 +199,7 @@ cat /data/raft/otter.key
 
 ## License
 
-Proprietary - See LICENSE file
+Proprietary - See LICENSE file (AGPL v3.0)
 
 ## Support
 

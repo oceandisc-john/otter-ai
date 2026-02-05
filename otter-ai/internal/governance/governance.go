@@ -387,6 +387,41 @@ func (g *Governance) GetActiveRules() map[string]*Rule {
 	return rules
 }
 
+// GetProposal returns a proposal by ID
+func (g *Governance) GetProposal(proposalID string) (*Proposal, bool) {
+	g.proposals.mu.RLock()
+	defer g.proposals.mu.RUnlock()
+
+	proposal, exists := g.proposals.proposals[proposalID]
+	return proposal, exists
+}
+
+// GetOpenProposals returns all open proposals
+func (g *Governance) GetOpenProposals() []*Proposal {
+	g.proposals.mu.RLock()
+	defer g.proposals.mu.RUnlock()
+
+	var openProposals []*Proposal
+	for _, proposal := range g.proposals.proposals {
+		if proposal.Status == ProposalOpen {
+			openProposals = append(openProposals, proposal)
+		}
+	}
+	return openProposals
+}
+
+// GetAllProposals returns all proposals (open and closed)
+func (g *Governance) GetAllProposals() []*Proposal {
+	g.proposals.mu.RLock()
+	defer g.proposals.mu.RUnlock()
+
+	var proposals []*Proposal
+	for _, proposal := range g.proposals.proposals {
+		proposals = append(proposals, proposal)
+	}
+	return proposals
+}
+
 // RequestJoin handles a join request
 func (g *Governance) RequestJoin(ctx context.Context, requesterID string, publicKey []byte) error {
 	// Only Super-Raft and Raft can induct new members
