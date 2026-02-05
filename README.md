@@ -53,8 +53,8 @@
      =}       :[*                                                                                   
      ):      *]                                                                                     
     -<     :}*                                                                                      
-    +*   *[<:                                                                    -:-:::-:-:-::--:   
-     <]<=                                                                               :           
+    +*   *[<:                                                                       
+     <]<=                                                                                          
                                                                                                     
 A production-grade, governed AI agent system with a chat-first UI interface.
 
