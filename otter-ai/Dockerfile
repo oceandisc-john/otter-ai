@@ -18,7 +18,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=1 go build -o otter ./cmd/keytool
+RUN CGO_ENABLED=1 go build -o otter ./cmd/otter
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
