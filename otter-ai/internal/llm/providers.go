@@ -146,9 +146,172 @@ func (p *OllamaProvider) Name() string {
 	return "ollama"
 }
 
-// NewOpenWebUIProvider creates a new OpenWebUI provider (same as Ollama)
-func NewOpenWebUIProvider(cfg config.LLMConfig) (*OllamaProvider, error) {
-	return NewOllamaProvider(cfg)
+// OpenWebUIProvider implements OpenWebUI's OpenAI-compatible API
+type OpenWebUIProvider struct {
+	endpoint string
+	model    string
+	apiKey   string
+	client   *http.Client
+}
+
+// NewOpenWebUIProvider creates a new OpenWebUI provider
+// OpenWebUI uses OpenAI-compatible API paths (/v1/*) not Ollama paths (/api/*)
+func NewOpenWebUIProvider(cfg config.LLMConfig) (*OpenWebUIProvider, error) {
+	return &OpenWebUIProvider{
+		endpoint: cfg.Endpoint,
+		model:    cfg.Model,
+		apiKey:   cfg.APIKey,
+		client:   &http.Client{},
+	}, nil
+}
+
+// Complete generates a completion using OpenWebUI's OpenAI-compatible chat API
+func (p *OpenWebUIProvider) Complete(ctx context.Context, request *CompletionRequest) (*CompletionResponse, error) {
+	messages := []map[string]string{}
+
+	if request.SystemPrompt != "" {
+		messages = append(messages, map[string]string{
+			"role":    "system",
+			"content": request.SystemPrompt,
+		})
+	}
+
+	messages = append(messages, map[string]string{
+		"role":    "user",
+		"content": request.Prompt,
+	})
+
+	reqBody := map[string]interface{}{
+		"model":    p.model,
+		"messages": messages,
+	}
+
+	if request.MaxTokens > 0 {
+		reqBody["max_tokens"] = request.MaxTokens
+	}
+
+	if request.Temperature > 0 {
+		reqBody["temperature"] = request.Temperature
+	}
+
+	if len(request.StopTokens) > 0 {
+		reqBody["stop"] = request.StopTokens
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.endpoint+"/api/chat/completions", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpenWebUI API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			TotalTokens int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if len(result.Choices) == 0 {
+		return nil, fmt.Errorf("no response from OpenWebUI")
+	}
+
+	return &CompletionResponse{
+		Text:         result.Choices[0].Message.Content,
+		TokensUsed:   result.Usage.TotalTokens,
+		FinishReason: result.Choices[0].FinishReason,
+	}, nil
+}
+
+// Embed generates embeddings using OpenWebUI's OpenAI-compatible embeddings API
+func (p *OpenWebUIProvider) Embed(ctx context.Context, text string) ([]float32, error) {
+	reqBody := map[string]interface{}{
+		"model": p.model,
+		"input": text,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.endpoint+"/api/embeddings", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpenWebUI API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// OpenAI-compatible format: {"data": [{"embedding": [...], "index": 0}], ...}
+	var result struct {
+		Data []struct {
+			Embedding []float32 `json:"embedding"`
+			Index     int       `json:"index"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if len(result.Data) == 0 {
+		return nil, fmt.Errorf("no embeddings returned from OpenWebUI")
+	}
+
+	return result.Data[0].Embedding, nil
+}
+
+// Name returns the provider name
+func (p *OpenWebUIProvider) Name() string {
+	return "openwebui"
 }
 
 // OpenAIProvider implements the OpenAI LLM provider

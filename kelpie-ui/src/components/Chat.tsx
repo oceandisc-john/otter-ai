@@ -7,6 +7,7 @@ const Chat: React.FC = () => {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -47,6 +48,10 @@ const Chat: React.FC = () => {
       setMessages(prev => [...prev, errorMessage]);
     } finally {
       setLoading(false);
+      // Return focus to input field after response
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 100);
     }
   };
 
@@ -81,6 +86,7 @@ const Chat: React.FC = () => {
       </div>
       <div className="input-area">
         <textarea
+          ref={inputRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyPress={handleKeyPress}

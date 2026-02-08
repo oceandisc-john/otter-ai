@@ -11,7 +11,7 @@ services:
     env_file:
       - ./otter-ai/.env
     volumes:
-      - otter-data:/data
+      - ./data:/data
     networks:
       - otter-network
     restart: unless-stopped
@@ -30,10 +30,6 @@ services:
     networks:
       - otter-network
     restart: unless-stopped
-
-volumes:
-  otter-data:
-    driver: local
 
 networks:
   otter-network:

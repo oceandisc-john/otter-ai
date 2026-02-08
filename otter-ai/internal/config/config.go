@@ -39,8 +39,9 @@ type LLMConfig struct {
 
 // APIConfig holds API server configuration
 type APIConfig struct {
-	Port int
-	Host string
+	Port       int
+	Host       string
+	Passphrase string // Authentication passphrase for UI access
 }
 
 // PluginConfig holds plugin configuration
@@ -83,8 +84,9 @@ func Load() (*Config, error) {
 			APIKey:   getEnv("OTTER_LLM_API_KEY", ""),
 		},
 		API: APIConfig{
-			Port: getEnvAsInt("OTTER_PORT", 8080),
-			Host: getEnv("OTTER_HOST", "0.0.0.0"),
+			Port:       getEnvAsInt("OTTER_PORT", 8080),
+			Host:       getEnv("OTTER_HOST", "0.0.0.0"),
+			Passphrase: getEnv("OTTER_HOST_PASSPHRASE", ""),
 		},
 		Plugins: PluginConfig{
 			Enabled: []string{},
@@ -104,14 +106,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("OTTER_RAFT_ID is required")
 	}
 
-	validRaftTypes := map[string]bool{
-		"super-raft": true,
-		"raft":       true,
-		"sub-raft":   true,
-	}
-	if !validRaftTypes[c.Raft.Type] {
-		return fmt.Errorf("invalid OTTER_RAFT_TYPE: %s (must be super-raft, raft, or sub-raft)", c.Raft.Type)
-	}
+	// Raft type validation removed - all otters start as their own raft
 
 	if c.Port < 1 || c.Port > 65535 {
 		return fmt.Errorf("invalid port: %d", c.Port)

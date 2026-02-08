@@ -19,11 +19,28 @@ body {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
 }
 
+.app.loading {
+  justify-content: center;
+  align-items: center;
+}
+
+.loader {
+  color: white;
+  font-size: 1.5rem;
+}
+
 .app-header {
   background: rgba(255, 255, 255, 0.95);
   padding: 20px;
-  text-align: center;
   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.header-content {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  max-width: 1200px;
+  margin: 0 auto;
 }
 
 .app-header h1 {
@@ -35,6 +52,23 @@ body {
 .subtitle {
   color: #666;
   font-size: 0.9rem;
+}
+
+.logout-button {
+  padding: 8px 16px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.logout-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
 }
 
 .app-main {
