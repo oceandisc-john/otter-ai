@@ -206,6 +206,12 @@ func (m *Memory) List(ctx context.Context, memoryType MemoryType, limit, offset 
 	return memories, nil
 }
 
+// GetVectorDB returns the underlying vector database
+// This is used by other internal packages like governance for direct database access
+func (m *Memory) GetVectorDB() vectordb.VectorDB {
+	return m.vectorDB
+}
+
 // getTableForType maps memory type to vector database table
 func (m *Memory) getTableForType(memoryType MemoryType) string {
 	switch memoryType {

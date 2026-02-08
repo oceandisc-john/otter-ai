@@ -62,6 +62,81 @@ func (v *SQLiteVectorDB) initTables() error {
 		}
 	}
 
+	// Create governance tables
+	if err := v.initGovernanceTables(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// initGovernanceTables creates tables for governance persistence
+func (v *SQLiteVectorDB) initGovernanceTables() error {
+	// Raft memberships table
+	_, err := v.db.Exec(`
+		CREATE TABLE IF NOT EXISTS governance_rafts (
+			raft_id TEXT PRIMARY KEY,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create governance_rafts table: %w", err)
+	}
+
+	// Raft members table
+	_, err = v.db.Exec(`
+		CREATE TABLE IF NOT EXISTS governance_members (
+			raft_id TEXT NOT NULL,
+			member_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			joined_at INTEGER NOT NULL,
+			last_seen_at INTEGER NOT NULL,
+			public_key BLOB,
+			signature BLOB,
+			inducted_by TEXT NOT NULL,
+			expires_at INTEGER,
+			PRIMARY KEY (raft_id, member_id),
+			FOREIGN KEY (raft_id) REFERENCES governance_rafts(raft_id)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create governance_members table: %w", err)
+	}
+
+	// Rules table
+	_, err = v.db.Exec(`
+		CREATE TABLE IF NOT EXISTS governance_rules (
+			rule_id TEXT PRIMARY KEY,
+			raft_id TEXT NOT NULL,
+			scope TEXT NOT NULL,
+			version INTEGER NOT NULL,
+			timestamp INTEGER NOT NULL,
+			body TEXT NOT NULL,
+			base_rule_id TEXT,
+			signature BLOB,
+			proposed_by TEXT NOT NULL,
+			adopted_at INTEGER,
+			FOREIGN KEY (raft_id) REFERENCES governance_rafts(raft_id)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create governance_rules table: %w", err)
+	}
+
+	// Create indices for faster lookups
+	indices := []string{
+		"CREATE INDEX IF NOT EXISTS idx_members_raft ON governance_members(raft_id)",
+		"CREATE INDEX IF NOT EXISTS idx_rules_raft ON governance_rules(raft_id)",
+		"CREATE INDEX IF NOT EXISTS idx_rules_scope ON governance_rules(scope)",
+	}
+
+	for _, indexQuery := range indices {
+		if _, err := v.db.Exec(indexQuery); err != nil {
+			return fmt.Errorf("failed to create governance index: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -256,6 +331,12 @@ func (v *SQLiteVectorDB) List(ctx context.Context, table string, limit, offset i
 // Close closes the database connection
 func (v *SQLiteVectorDB) Close() error {
 	return v.db.Close()
+}
+
+// GetDB returns the underlying database connection for direct queries
+// This is used by other internal packages like governance for persistence
+func (v *SQLiteVectorDB) GetDB() *sql.DB {
+	return v.db
 }
 
 // cosineSimilarity calculates cosine similarity between two vectors

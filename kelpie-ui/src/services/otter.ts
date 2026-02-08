@@ -9,6 +9,31 @@ const api = axios.create({
   },
 });
 
+// Storage key for authentication token
+const AUTH_TOKEN_KEY = 'otter_auth_token';
+
+// Add authentication interceptor
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem(AUTH_TOKEN_KEY);
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Handle unauthorized responses
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      // Clear invalid token and redirect to login
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+      window.location.reload();
+    }
+    return Promise.reject(error);
+  }
+);
+
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -42,6 +67,28 @@ export interface Proposal {
 }
 
 export const otterService = {
+  // Authentication
+  async authenticate(passphrase: string): Promise<boolean> {
+    try {
+      const response = await api.post('/api/v1/auth', { passphrase });
+      if (response.data.authenticated) {
+        localStorage.setItem(AUTH_TOKEN_KEY, passphrase);
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  },
+
+  isAuthenticated(): boolean {
+    return !!localStorage.getItem(AUTH_TOKEN_KEY);
+  },
+
+  logout(): void {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+  },
+
   // Chat
   async sendMessage(message: string): Promise<string> {
     const response = await api.post('/api/v1/chat', { message });

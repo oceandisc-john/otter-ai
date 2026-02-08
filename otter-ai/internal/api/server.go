@@ -33,19 +33,19 @@ func NewServer(cfg config.APIConfig, agent *agent.Agent) *Server {
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
-	// Health check
+	// Health check (no auth required)
 	mux.HandleFunc("/health", s.handleHealth)
 
-	// Agent endpoints
-	mux.HandleFunc("POST /api/v1/chat", s.handleChat)
-	// Memories are read-only - only the otter agent can create/modify them
-	mux.HandleFunc("GET /api/v1/memories", s.handleListMemories)
+	// Authentication endpoint
+	mux.HandleFunc("POST /api/v1/auth", s.handleAuth)
 
-	// Governance endpoints
-	mux.HandleFunc("GET /api/v1/governance/rules", s.handleListRules)
-	mux.HandleFunc("POST /api/v1/governance/rules", s.handleProposeRule)
-	mux.HandleFunc("POST /api/v1/governance/vote", s.handleVote)
-	mux.HandleFunc("GET /api/v1/governance/members", s.handleListMembers)
+	// Protected endpoints - require authentication
+	mux.HandleFunc("POST /api/v1/chat", s.requireAuth(s.handleChat))
+	mux.HandleFunc("GET /api/v1/memories", s.requireAuth(s.handleListMemories))
+	mux.HandleFunc("GET /api/v1/governance/rules", s.requireAuth(s.handleListRules))
+	mux.HandleFunc("POST /api/v1/governance/rules", s.requireAuth(s.handleProposeRule))
+	mux.HandleFunc("POST /api/v1/governance/vote", s.requireAuth(s.handleVote))
+	mux.HandleFunc("GET /api/v1/governance/members", s.requireAuth(s.handleListMembers))
 
 	// CORS middleware
 	handler := corsMiddleware(mux)
@@ -132,6 +132,7 @@ func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {
 // handleProposeRule handles proposing a new rule
 func (s *Server) handleProposeRule(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		RaftID     string `json:"raft_id"` // Optional: defaults to otter's own raft
 		Scope      string `json:"scope"`
 		Body       string `json:"body"`
 		ProposedBy string `json:"proposed_by"`
@@ -143,6 +144,12 @@ func (s *Server) handleProposeRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Default to otter's own raft if not specified
+	raftID := req.RaftID
+	if raftID == "" {
+		raftID = s.agent.GetGovernance().GetID() // Use otter's own raft ID
+	}
+
 	rule := &governance.Rule{
 		Scope:      req.Scope,
 		Body:       req.Body,
@@ -151,7 +158,7 @@ func (s *Server) handleProposeRule(w http.ResponseWriter, r *http.Request) {
 		Timestamp:  time.Now(),
 	}
 
-	proposal, err := s.agent.GetGovernance().ProposeRule(r.Context(), rule)
+	proposal, err := s.agent.GetGovernance().ProposeRule(r.Context(), raftID, rule)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
@@ -184,10 +191,92 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleListMembers handles listing raft members (stub)
+// handleListMembers handles listing raft members
 func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement member listing
-	respondJSON(w, http.StatusOK, []interface{}{})
+	raftID := r.URL.Query().Get("raft_id")
+	if raftID == "" {
+		// Default to otter's own raft
+		raftID = s.agent.GetGovernance().GetID()
+	}
+
+	// Get members from the specified raft
+	members, err := s.agent.GetGovernance().GetRaftMembers(raftID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	// Format members for response
+	response := make([]interface{}, 0, len(members))
+	for _, member := range members {
+		response = append(response, map[string]interface{}{
+			"id":          member.ID,
+			"state":       string(member.State),
+			"joined_at":   member.JoinedAt,
+			"last_seen":   member.LastSeenAt,
+			"inducted_by": member.InductedBy,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// handleAuth handles authentication requests
+func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Passphrase string `json:"passphrase"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// If no passphrase is configured, allow access
+	if s.config.Passphrase == "" {
+		respondJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+		return
+	}
+
+	// Check passphrase
+	if req.Passphrase == s.config.Passphrase {
+		respondJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+	} else {
+		respondError(w, http.StatusUnauthorized, "invalid passphrase")
+	}
+}
+
+// requireAuth is a middleware that checks for valid authentication
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// If no passphrase is configured, allow all requests
+		if s.config.Passphrase == "" {
+			next(w, r)
+			return
+		}
+
+		// Check Authorization header
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			respondError(w, http.StatusUnauthorized, "missing authorization header")
+			return
+		}
+
+		// Expect "Bearer <passphrase>"
+		const prefix = "Bearer "
+		if len(authHeader) < len(prefix) || authHeader[:len(prefix)] != prefix {
+			respondError(w, http.StatusUnauthorized, "invalid authorization format")
+			return
+		}
+
+		passphrase := authHeader[len(prefix):]
+		if passphrase != s.config.Passphrase {
+			respondError(w, http.StatusUnauthorized, "invalid passphrase")
+			return
+		}
+
+		next(w, r)
+	}
 }
 
 // corsMiddleware adds CORS headers

@@ -168,7 +168,7 @@ func (a *Agent) handleGovernanceAction(ctx context.Context, message string) (str
 
 1. "active_rules" - User wants to see currently active/adopted rules that are in effect
 2. "proposals" - User wants to see rule proposals (open for voting, pending, or voting status)
-3. "propose_rule" - User wants to submit a new rule proposal
+3. "propose_rule" - User wants to CREATE/submit a new rule proposal, or is discussing ideas they want to formalize
 4. "vote" - User wants you (the agent) to vote on a proposal or indicates voting preference
 5. "not_governance" - User is not asking about governance
 
@@ -183,6 +183,13 @@ Examples:
 - "what rules are open" -> proposals (rules "open" for voting means proposals)
 - "you should propose [rule text]" -> propose_rule
 - "propose this rule: [text]" -> propose_rule
+- "I think [idea] might be a good starting point" -> propose_rule (expressing ideas to formalize)
+- "would you propose this?" -> propose_rule
+- "how can we create a proposal" -> propose_rule
+- "let's make a rule about" -> propose_rule
+- "how can we shape these thoughts into a proposal" -> propose_rule
+- "I'd like to suggest" -> propose_rule
+- "can you help me draft a rule" -> propose_rule
 - "vote yes on that" -> vote
 - "I think you should vote for the first one" -> vote
 - "you should against the first one, and for the second" -> vote
@@ -196,7 +203,7 @@ Respond with ONLY one word: active_rules, proposals, propose_rule, vote, or not_
 	response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
 		Prompt:      classificationPrompt,
 		MaxTokens:   10,
-		Temperature: 0.3, // Low temperature for consistent classification
+		Temperature: 1.0, // Use default for compatibility with all models
 	})
 
 	if err != nil {
@@ -236,17 +243,29 @@ Respond with ONLY one word: active_rules, proposals, propose_rule, vote, or not_
 
 // handleRuleProposal handles submitting a new rule proposal
 func (a *Agent) handleRuleProposal(ctx context.Context, message string) string {
-	// Use LLM to extract the rule content from the conversation
-	fmt.Println("Extracting rule content from message...")
-	extractPrompt := fmt.Sprintf(`Extract the governance rule being proposed from this message. Return ONLY the rule text itself, nothing else.
+	// Use LLM to extract and formalize rule content from the conversation
+	fmt.Println("Extracting and formalizing rule content from message...")
+	extractPrompt := fmt.Sprintf(`The user is expressing ideas for a governance rule. Your task is to:
+1. Extract all the ideas and principles they've mentioned
+2. Synthesize them into a clear, concise governance rule
+3. Format it as a formal rule statement
 
-Message: %s
+User's message: %s
 
-If there's a rule mentioned in quotes or as a specific statement, return that rule. If the user is referring to a rule from earlier in the conversation, return that rule.`, message)
+If the message contains multiple ideas or principles, combine them into a single coherent rule. If the user is asking how to formalize their thoughts, take their expressed ideas and draft a proper rule statement.
+
+Examples:
+Input: "I think respect and kindness should be foundational"
+Output: "All interactions must be conducted with mutual respect and kindness"
+
+Input: "Everyone should have their own space and feel secure in it"
+Output: "Each member has sovereignty over their own domain and this autonomy must be respected"
+
+Return ONLY the rule text as a clear, actionable statement. Do not include explanations or meta-commentary.`, message)
 
 	response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
 		Prompt:      extractPrompt,
-		MaxTokens:   200,
+		MaxTokens:   300,
 		Temperature: 1.0,
 	})
 
@@ -262,22 +281,25 @@ If there's a rule mentioned in quotes or as a specific statement, return that ru
 	}
 
 	// Create the rule proposal
-	// Note: ProposedBy should be set to the raft member ID
-	// For now, we'll use "otter-1" as the default proposer
+	// ProposedBy is set to this otter's ID (which is also its initial raft ID)
+	otterID := a.governance.GetID()
 	rule := &governance.Rule{
 		Scope:      "general",
 		Body:       ruleBody,
-		ProposedBy: "otter-1", // Use the agent's raft ID
+		ProposedBy: otterID,
 		Timestamp:  time.Now(),
 	}
 
+	// Use otter's own raft for proposing (every otter starts as their own raft)
+	raftID := a.governance.GetID()
+
 	fmt.Printf("Attempting to propose rule to governance system...\n")
-	proposal, err := a.governance.ProposeRule(ctx, rule)
+	proposal, err := a.governance.ProposeRule(ctx, raftID, rule)
 	if err != nil {
 		fmt.Printf("Governance ProposeRule error: %v\n", err)
 		// Handle the "must be an active member" error gracefully
 		if strings.Contains(err.Error(), "proposer must be an active member") {
-			return fmt.Sprintf("I've recorded your rule proposal:\n\n\"%s\"\n\nNote: The governance system requires active raft membership to formally propose rules. Currently, there are no active members in the raft cluster. To fully enable governance, you would need to initialize the raft membership system.", ruleBody)
+			return fmt.Sprintf("I've drafted a rule proposal based on your ideas:\n\n\"%s\"\n\nNote: The governance system requires active raft membership to formally propose rules. Currently, there are no active members in the raft cluster. To fully enable governance, you would need to initialize the raft membership system.", ruleBody)
 		}
 		return fmt.Sprintf("I tried to propose the rule but encountered an error: %v", err)
 	}
@@ -324,7 +346,7 @@ If you can't parse voting instructions, return: []`, proposalsContext, message)
 	response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
 		Prompt:      extractPrompt,
 		MaxTokens:   200,
-		Temperature: 0.3,
+		Temperature: 1.0, // Use default for compatibility with all models
 	})
 
 	if err != nil {
@@ -441,7 +463,27 @@ func (a *Agent) handleRuleQuery(ctx context.Context) string {
 	rules := a.governance.GetActiveRules()
 
 	if len(rules) == 0 {
-		return "There are currently no active governance rules in the system."
+		// Use LLM to reflect on the absence of governance rules
+		prompt := `You are an AI assistant in a governance system. The user has asked about active governance rules, but there are currently no rules in place.
+
+Reflect thoughtfully on what this means:
+- Explain that the governance system is currently operating without formal rules
+- Discuss the implications of having no established guidelines
+- Suggest that this might be a good opportunity to propose and establish foundational rules
+- Encourage the user to think about what guidelines would be most valuable for the system
+
+Keep your response conversational, helpful, and encouraging. This is a chance to help bootstrap the governance process.`
+
+		response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
+			Prompt:      prompt,
+			Temperature: 1.0,
+			MaxTokens:   300,
+		})
+		if err != nil {
+			fmt.Printf("Failed to generate reflection on empty rules: %v\n", err)
+			return "There are currently no active governance rules in the system. This might be a good opportunity to propose some foundational guidelines!"
+		}
+		return response.Text
 	}
 
 	var response strings.Builder
@@ -518,7 +560,27 @@ func (a *Agent) handleProposalQuery(ctx context.Context, message string) string 
 	openProposals := a.governance.GetOpenProposals()
 
 	if len(openProposals) == 0 {
-		return "There are currently no open proposals. All proposals have been closed."
+		// Use LLM to reflect on the absence of proposals
+		prompt := `You are an AI assistant in a governance system. The user has asked about current proposals, but there are no open proposals at the moment.
+
+Reflect thoughtfully on what this means:
+- Explain that there are currently no proposals being voted on
+- This could mean either the system is new, or all previous proposals have been decided upon
+- Suggest that if they have ideas for how the system should operate, they could propose new rules
+- Keep it conversational and encouraging
+
+Keep your response brief and helpful.`
+
+		response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
+			Prompt:      prompt,
+			Temperature: 1.0,
+			MaxTokens:   200,
+		})
+		if err != nil {
+			fmt.Printf("Failed to generate reflection on empty proposals: %v\n", err)
+			return "There are currently no open proposals. If you have ideas for governance rules, feel free to propose them!"
+		}
+		return response.Text
 	}
 
 	var response strings.Builder
