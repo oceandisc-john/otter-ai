@@ -72,7 +72,9 @@ export const otterService = {
     try {
       const response = await api.post('/api/v1/auth', { passphrase });
       if (response.data.authenticated) {
-        localStorage.setItem(AUTH_TOKEN_KEY, passphrase);
+        // Store JWT token instead of passphrase
+        const token = response.data.token || passphrase; // Fallback for backward compatibility
+        localStorage.setItem(AUTH_TOKEN_KEY, token);
         return true;
       }
       return false;
@@ -95,19 +97,14 @@ export const otterService = {
     return response.data.response;
   },
 
+  async clearConversation(): Promise<void> {
+    await api.post('/api/v1/chat/clear');
+  },
+
   // Memories
   async getMemories(type: string = 'long_term'): Promise<Memory[]> {
     const response = await api.get(`/api/v1/memories?type=${type}`);
     return response.data;
-  },
-
-  async createMemory(content: string, type: string, importance: number): Promise<string> {
-    const response = await api.post('/api/v1/memories', { content, type, importance });
-    return response.data.id;
-  },
-
-  async deleteMemory(id: string, type: string = 'long_term'): Promise<void> {
-    await api.delete(`/api/v1/memories/${id}?type=${type}`);
   },
 
   // Governance

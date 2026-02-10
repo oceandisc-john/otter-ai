@@ -11,6 +11,17 @@ import (
 	"otter-ai/internal/memory"
 )
 
+// Constants for governance thresholds and timeouts
+const (
+	MemberExpirationDays    = 90
+	LivenessCheckInterval   = 1 * time.Hour
+	QuorumPercentage        = 67 // 2/3 majority
+	SuperMajorityPercentage = 75 // 3/4 majority for overrides
+	MinimumVotingMembers    = 2
+	UnanimousVotingMembers  = 2
+	SoloRaftAutoAdopt       = 1
+)
+
 // Governance system implementing Raft-based governance model
 type Governance struct {
 	config       RaftConfig
@@ -270,7 +281,7 @@ func (g *Governance) initializeSelf() error {
 
 // livenessMonitor checks for expired members
 func (g *Governance) livenessMonitor() {
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(LivenessCheckInterval)
 	defer ticker.Stop()
 
 	for {
@@ -288,14 +299,14 @@ func (g *Governance) checkExpiredMembers() {
 	g.rafts.mu.Lock()
 	defer g.rafts.mu.Unlock()
 
-	expirationThreshold := time.Now().Add(-90 * 24 * time.Hour)
+	expirationThreshold := time.Now().Add(-MemberExpirationDays * 24 * time.Hour)
 
 	for _, raft := range g.rafts.rafts {
 		raft.mu.Lock()
 		for _, member := range raft.Members {
 			if member.State == StateActive && member.LastSeenAt.Before(expirationThreshold) {
 				member.State = StateExpired
-				expiresAt := member.LastSeenAt.Add(90 * 24 * time.Hour)
+				expiresAt := member.LastSeenAt.Add(MemberExpirationDays * 24 * time.Hour)
 				member.ExpiresAt = &expiresAt
 			}
 		}
@@ -442,7 +453,7 @@ func (g *Governance) checkProposalOutcome(proposal *Proposal) {
 	default:
 		// 3+ otters: 2/3 majority of total active members
 		// Quorum: at least 2/3 must participate
-		quorumThreshold := (totalActive*2 + 2) / 3 // Ceiling of 2/3
+		quorumThreshold := (totalActive*QuorumPercentage + 99) / 100 // Ceiling calculation
 		proposal.QuorumMet = votescast >= quorumThreshold
 
 		if !proposal.QuorumMet {
@@ -458,11 +469,11 @@ func (g *Governance) checkProposalOutcome(proposal *Proposal) {
 
 		if needsSuperMajority {
 			// Super-majority: YES > 75% of total active members
-			requiredVotes := (totalActive*3 + 3) / 4 // Ceiling of 75%
+			requiredVotes := (totalActive*SuperMajorityPercentage + 99) / 100 // Ceiling calculation
 			adopted = yesVotes >= requiredVotes
 		} else {
 			// 2/3 majority: YES >= 2/3 of total active members
-			requiredVotes := (totalActive*2 + 2) / 3 // Ceiling of 2/3
+			requiredVotes := (totalActive*QuorumPercentage + 99) / 100 // Ceiling calculation
 			adopted = yesVotes >= requiredVotes
 		}
 

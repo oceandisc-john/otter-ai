@@ -7,8 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"otter-ai/internal/config"
+)
+
+// Constants for LLM provider configuration
+const (
+	LLMClientTimeout = 120 * time.Second // Timeout for LLM API requests
 )
 
 // OllamaProvider implements the Ollama LLM provider
@@ -23,7 +29,7 @@ func NewOllamaProvider(cfg config.LLMConfig) (*OllamaProvider, error) {
 	return &OllamaProvider{
 		endpoint: cfg.Endpoint,
 		model:    cfg.Model,
-		client:   &http.Client{},
+		client:   &http.Client{Timeout: LLMClientTimeout},
 	}, nil
 }
 
@@ -161,7 +167,7 @@ func NewOpenWebUIProvider(cfg config.LLMConfig) (*OpenWebUIProvider, error) {
 		endpoint: cfg.Endpoint,
 		model:    cfg.Model,
 		apiKey:   cfg.APIKey,
-		client:   &http.Client{},
+		client:   &http.Client{Timeout: LLMClientTimeout},
 	}, nil
 }
 
@@ -332,7 +338,7 @@ func NewOpenAIProvider(cfg config.LLMConfig) (*OpenAIProvider, error) {
 		endpoint: cfg.Endpoint,
 		model:    cfg.Model,
 		apiKey:   cfg.APIKey,
-		client:   &http.Client{},
+		client:   &http.Client{Timeout: LLMClientTimeout},
 	}, nil
 }
 

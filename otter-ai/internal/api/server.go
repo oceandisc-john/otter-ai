@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"otter-ai/internal/agent"
@@ -14,18 +15,38 @@ import (
 	"otter-ai/internal/memory"
 )
 
+// Constants for API server configuration
+const (
+	ServerReadTimeout  = 30 * time.Second
+	ServerWriteTimeout = 150 * time.Second // Allow enough time for LLM API calls (120s) + buffer
+	ServerIdleTimeout  = 60 * time.Second
+)
+
 // Server is the REST API server
 type Server struct {
-	config config.APIConfig
-	agent  *agent.Agent
-	server *http.Server
+	config      config.APIConfig
+	agent       *agent.Agent
+	server      *http.Server
+	jwtManager  *JWTManager
+	rateLimiter *RateLimiter
 }
 
 // NewServer creates a new API server
 func NewServer(cfg config.APIConfig, agent *agent.Agent) *Server {
+	// Initialize JWT manager
+	jwtManager, err := NewJWTManager(cfg.JWTSecret)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize JWT manager: %v", err)
+	}
+
+	// Initialize rate limiter
+	rateLimiter := NewRateLimiter(cfg.RateLimit, cfg.RateLimitWindow)
+
 	return &Server{
-		config: cfg,
-		agent:  agent,
+		config:      cfg,
+		agent:       agent,
+		jwtManager:  jwtManager,
+		rateLimiter: rateLimiter,
 	}
 }
 
@@ -41,21 +62,22 @@ func (s *Server) Start() error {
 
 	// Protected endpoints - require authentication
 	mux.HandleFunc("POST /api/v1/chat", s.requireAuth(s.handleChat))
+	mux.HandleFunc("POST /api/v1/chat/clear", s.requireAuth(s.handleClearChat))
 	mux.HandleFunc("GET /api/v1/memories", s.requireAuth(s.handleListMemories))
 	mux.HandleFunc("GET /api/v1/governance/rules", s.requireAuth(s.handleListRules))
 	mux.HandleFunc("POST /api/v1/governance/rules", s.requireAuth(s.handleProposeRule))
 	mux.HandleFunc("POST /api/v1/governance/vote", s.requireAuth(s.handleVote))
 	mux.HandleFunc("GET /api/v1/governance/members", s.requireAuth(s.handleListMembers))
 
-	// CORS middleware
-	handler := corsMiddleware(mux)
+	// Apply middleware chain: rate limiting -> CORS
+	handler := corsMiddleware(s.rateLimiter.Middleware(mux))
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", s.config.Host, s.config.Port),
 		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  ServerReadTimeout,
+		WriteTimeout: ServerWriteTimeout,
+		IdleTimeout:  ServerIdleTimeout,
 	}
 
 	log.Printf("API server listening on %s", s.server.Addr)
@@ -92,6 +114,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(req.Message) > 10000 {
+		respondError(w, http.StatusBadRequest, "message too long (max 10000 characters)")
+		return
+	}
+
 	response, err := s.agent.ProcessMessage(r.Context(), req.Message)
 	if err != nil {
 		log.Printf("Error processing message: %v", err)
@@ -101,6 +128,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	respondJSON(w, http.StatusOK, map[string]string{
 		"response": response,
+	})
+}
+
+// handleClearChat clears the conversation history
+func (s *Server) handleClearChat(w http.ResponseWriter, r *http.Request) {
+	s.agent.ClearConversation()
+	respondJSON(w, http.StatusOK, map[string]string{
+		"message": "Conversation history cleared",
 	})
 }
 
@@ -144,6 +179,21 @@ func (s *Server) handleProposeRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Scope == "" || req.Body == "" || req.ProposedBy == "" {
+		respondError(w, http.StatusBadRequest, "scope, body, and proposed_by are required")
+		return
+	}
+
+	if len(req.Body) > 1000 {
+		respondError(w, http.StatusBadRequest, "rule body too long (max 1000 characters)")
+		return
+	}
+
+	if len(req.Scope) > 100 {
+		respondError(w, http.StatusBadRequest, "scope too long (max 100 characters)")
+		return
+	}
+
 	// Default to otter's own raft if not specified
 	raftID := req.RaftID
 	if raftID == "" {
@@ -177,6 +227,17 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ProposalID == "" || req.VoterID == "" || req.Vote == "" {
+		respondError(w, http.StatusBadRequest, "proposal_id, voter_id, and vote are required")
+		return
+	}
+
+	vote := governance.VoteType(req.Vote)
+	if vote != governance.VoteYes && vote != governance.VoteNo && vote != governance.VoteAbstain {
+		respondError(w, http.StatusBadRequest, "vote must be YES, NO, or ABSTAIN")
 		return
 	}
 
@@ -232,18 +293,34 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If no passphrase is configured, allow access
+	// If no passphrase is configured, allow access without JWT
 	if s.config.Passphrase == "" {
-		respondJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"authenticated": true,
+			"token":         "",
+		})
 		return
 	}
 
-	// Check passphrase
-	if req.Passphrase == s.config.Passphrase {
-		respondJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
-	} else {
+	// Validate passphrase
+	if req.Passphrase != s.config.Passphrase {
 		respondError(w, http.StatusUnauthorized, "invalid passphrase")
+		return
 	}
+
+	// Generate JWT token
+	token, err := s.jwtManager.GenerateToken("otter-user")
+	if err != nil {
+		log.Printf("Error generating JWT token: %v", err)
+		respondError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"authenticated": true,
+		"token":         token,
+		"expires_in":    int(JWTExpirationTime.Seconds()),
+	})
 }
 
 // requireAuth is a middleware that checks for valid authentication
@@ -262,26 +339,35 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Expect "Bearer <passphrase>"
+		// Expect "Bearer <token>"
 		const prefix = "Bearer "
-		if len(authHeader) < len(prefix) || authHeader[:len(prefix)] != prefix {
+		if len(authHeader) < len(prefix) || !strings.HasPrefix(authHeader, prefix) {
 			respondError(w, http.StatusUnauthorized, "invalid authorization format")
 			return
 		}
 
-		passphrase := authHeader[len(prefix):]
-		if passphrase != s.config.Passphrase {
-			respondError(w, http.StatusUnauthorized, "invalid passphrase")
+		token := strings.TrimSpace(authHeader[len(prefix):])
+
+		// Validate JWT token
+		claims, err := s.jwtManager.ValidateToken(token)
+		if err != nil {
+			respondError(w, http.StatusUnauthorized, "invalid or expired token")
 			return
 		}
+
+		// Token is valid, add claims to request context if needed
+		_ = claims // Can be used for user identification in the future
 
 		next(w, r)
 	}
 }
 
 // corsMiddleware adds CORS headers
+// WARNING: Allows all origins (*) - restrict in production
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// TODO: Restrict to specific origins in production
+		// For now, allow all for development convenience
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")

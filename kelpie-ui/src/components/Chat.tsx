@@ -62,8 +62,32 @@ const Chat: React.FC = () => {
     }
   };
 
+  const handleNewTopic = async () => {
+    if (loading) return;
+    
+    try {
+      await otterService.clearConversation();
+      setMessages([]);
+      setInput('');
+      inputRef.current?.focus();
+    } catch (error) {
+      console.error('Failed to clear conversation:', error);
+    }
+  };
+
   return (
     <div className="chat-container">
+      <div className="chat-header">
+        <h2>Chat with Otter</h2>
+        <button 
+          className="new-topic-btn" 
+          onClick={handleNewTopic} 
+          disabled={loading || messages.length === 0}
+          title="Start a new conversation topic"
+        >
+          🔄 New Topic
+        </button>
+      </div>
       <div className="messages">
         {messages.map((msg, idx) => (
           <div key={idx} className={`message ${msg.role}`}>

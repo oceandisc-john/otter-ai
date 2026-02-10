@@ -69,7 +69,7 @@ A production-grade, governed AI agent system with a chat-first UI interface.
 - **Memory Layer**: Vector database for bounded, auditable memory
 - **LLM Abstraction**: Pluggable providers (Ollama, OpenAI, Anthropic, OpenWebUI)
 - **Plugin System**: Discord, Signal, Telegram, Slack integrations
-- **Cryptography**: Hybrid ECDH + Kyber key exchange with AES-256
+- **Security**: JWT authentication, rate limiting, hybrid ECDH + Kyber key exchange with AES-256
 - **Local-First**: Containerized, runs entirely locally
 
 ## Quick Start
@@ -103,7 +103,9 @@ make all purge
 - **Otter-AI API**: http://localhost:8080
 - **Health Check**: http://localhost:8080/health
 
-**Authentication**: If `OTTER_HOST_PASSPHRASE` is configured, you'll need to authenticate when accessing Kelpie UI. The API will require a Bearer token obtained from the `/auth` endpoint.
+**Authentication**: If `OTTER_HOST_PASSPHRASE` is configured, you'll need to authenticate when accessing Kelpie UI. The API will require a JWT token obtained from the `/auth` endpoint.
+
+**Security**: See [SECURITY.md](SECURITY.md) for details on JWT authentication, rate limiting, and security best practices.
 
 ## Configuration
 
@@ -121,19 +123,29 @@ Required configuration:
 
 Optional security configuration:
 - `OTTER_HOST_PASSPHRASE`: Passphrase to protect API and Kelpie UI access. Leave empty or unset to disable authentication.
+- `OTTER_JWT_SECRET`: Secret key for JWT token signing. If not set, a random secret is generated on startup (tokens invalidated on restart).
+- `OTTER_RATE_LIMIT`: Maximum requests per time window (default: 100)
+- `OTTER_RATE_LIMIT_WINDOW`: Time window for rate limiting (default: 1m). Examples: 30s, 5m, 1h
 
 ## API Endpoints
 
 ### Authentication
 - `POST /auth` - Authenticate with passphrase (if `OTTER_HOST_PASSPHRASE` is configured)
   - Request: `{"passphrase": "your-passphrase"}`
-  - Response: `{"token": "jwt-token"}`
+  - Response: `{"token": "jwt-token", "expiresAt": "2024-01-01T00:00:00Z"}`
   - Use the token in subsequent requests: `Authorization: Bearer <token>`
+  - Tokens expire after 24 hours
 
-**Note**: All endpoints below require authentication if `OTTER_HOST_PASSPHRASE` is set.
+**Note**: All endpoints below require authentication if `OTTER_HOST_PASSPHRASE` is set. Rate limiting applies to all endpoints (default: 100 requests/minute per IP).
 
 ### Chat
 - `POST /api/v1/chat` - Send a message
+  - Request: `{"message": "your message"}`
+  - Response: `{"response": "Otter's response"}`
+  - Maintains conversation context for natural multi-turn dialogues
+- `POST /api/v1/chat/clear` - Clear conversation history
+  - Useful for starting a new topic or resetting context
+  - No request body required
 
 ### Memory
 - `GET /api/v1/memories` - List memories (read-only)

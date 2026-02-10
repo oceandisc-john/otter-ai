@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -39,9 +40,12 @@ type LLMConfig struct {
 
 // APIConfig holds API server configuration
 type APIConfig struct {
-	Port       int
-	Host       string
-	Passphrase string // Authentication passphrase for UI access
+	Port            int
+	Host            string
+	Passphrase      string        // Authentication passphrase for UI access
+	JWTSecret       string        // JWT signing secret (auto-generated if empty)
+	RateLimit       int           // Requests per window
+	RateLimitWindow time.Duration // Rate limit time window
 }
 
 // PluginConfig holds plugin configuration
@@ -84,9 +88,12 @@ func Load() (*Config, error) {
 			APIKey:   getEnv("OTTER_LLM_API_KEY", ""),
 		},
 		API: APIConfig{
-			Port:       getEnvAsInt("OTTER_PORT", 8080),
-			Host:       getEnv("OTTER_HOST", "0.0.0.0"),
-			Passphrase: getEnv("OTTER_HOST_PASSPHRASE", ""),
+			Port:            getEnvAsInt("OTTER_PORT", 8080),
+			Host:            getEnv("OTTER_HOST", "0.0.0.0"),
+			Passphrase:      getEnv("OTTER_HOST_PASSPHRASE", ""),
+			JWTSecret:       getEnv("OTTER_JWT_SECRET", ""),
+			RateLimit:       getEnvAsInt("OTTER_RATE_LIMIT", 100),
+			RateLimitWindow: getEnvAsDuration("OTTER_RATE_LIMIT_WINDOW", 1*time.Minute),
 		},
 		Plugins: PluginConfig{
 			Enabled: []string{},
@@ -139,6 +146,19 @@ func getEnvAsInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	value, err := strconv.Atoi(valueStr)
+	if err != nil {
+		return defaultValue
+	}
+	return value
+}
+
+// getEnvAsDuration retrieves an environment variable as a duration or returns a default value
+func getEnvAsDuration(key string, defaultValue time.Duration) time.Duration {
+	valueStr := os.Getenv(key)
+	if valueStr == "" {
+		return defaultValue
+	}
+	value, err := time.ParseDuration(valueStr)
 	if err != nil {
 		return defaultValue
 	}

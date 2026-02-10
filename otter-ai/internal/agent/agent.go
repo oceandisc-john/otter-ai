@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"otter-ai/internal/governance"
@@ -15,12 +15,37 @@ import (
 	"otter-ai/internal/plugins"
 )
 
+// Constants for agent configuration
+const (
+	DefaultMemorySearchLimit = 5
+	DefaultMaxTokens         = 300
+	DefaultTemperature       = 1.0
+	MaxVoteInstructions      = 200
+	MaxMessageLength         = 10000
+	MaxRuleBodyLength        = 1000
+	ConversationHistoryLimit = 10 // Keep last 10 messages in conversation context
+)
+
+// ConversationMessage represents a single message in conversation history
+type ConversationMessage struct {
+	Role      string // "user" or "assistant"
+	Content   string
+	Timestamp time.Time
+}
+
+// ConversationHistory tracks recent messages for context
+type ConversationHistory struct {
+	mutex    sync.RWMutex
+	messages []ConversationMessage
+}
+
 // Agent represents the Otter-AI agent
 type Agent struct {
-	memory     *memory.Memory
-	governance *governance.Governance
-	llm        llm.Provider
-	plugins    *plugins.Manager
+	memory       *memory.Memory
+	governance   *governance.Governance
+	llm          llm.Provider
+	plugins      *plugins.Manager
+	conversation *ConversationHistory
 }
 
 // Config holds agent configuration
@@ -38,25 +63,73 @@ func New(cfg Config) *Agent {
 		governance: cfg.Governance,
 		llm:        cfg.LLM,
 		plugins:    cfg.Plugins,
+		conversation: &ConversationHistory{
+			messages: make([]ConversationMessage, 0, ConversationHistoryLimit),
+		},
 	}
+}
+
+// AddToConversation adds a message to the conversation history
+func (ch *ConversationHistory) Add(role, content string) {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+
+	ch.messages = append(ch.messages, ConversationMessage{
+		Role:      role,
+		Content:   content,
+		Timestamp: time.Now(),
+	})
+
+	// Keep only the last N messages
+	if len(ch.messages) > ConversationHistoryLimit {
+		ch.messages = ch.messages[len(ch.messages)-ConversationHistoryLimit:]
+	}
+}
+
+// GetRecent returns recent messages for context
+func (ch *ConversationHistory) GetRecent(limit int) []ConversationMessage {
+	ch.mutex.RLock()
+	defer ch.mutex.RUnlock()
+
+	if len(ch.messages) == 0 {
+		return nil
+	}
+
+	start := len(ch.messages) - limit
+	if start < 0 {
+		start = 0
+	}
+	return append([]ConversationMessage{}, ch.messages[start:]...)
+}
+
+// Clear clears the conversation history
+func (ch *ConversationHistory) Clear() {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+	ch.messages = make([]ConversationMessage, 0, ConversationHistoryLimit)
 }
 
 // ProcessMessage processes an incoming message
 func (a *Agent) ProcessMessage(ctx context.Context, message string) (string, error) {
+	// Validate message length
+	if len(message) > MaxMessageLength {
+		return "", fmt.Errorf("message too long (max %d characters)", MaxMessageLength)
+	}
+
 	// Generate embedding for the message
 	embedding, err := a.llm.Embed(ctx, message)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate embedding: %w", err)
 	}
 
-	// Check if this is a governance action request
-	if action, handled := a.handleGovernanceAction(ctx, message); handled {
+	// Check if this requires a special governance action (propose rule or vote)
+	if action, handled := a.detectGovernanceAction(ctx, message); handled {
 		// Store the interaction as memory
 		interactionMemory := &memory.MemoryRecord{
 			Type:       memory.MemoryTypeLongTerm,
 			Content:    fmt.Sprintf("User: %s\nOtter: %s", message, action),
 			Embedding:  embedding,
-			Importance: 0.7, // Higher importance for governance actions
+			Importance: 0.7,
 			Metadata: map[string]interface{}{
 				"user_message": message,
 				"response":     action,
@@ -67,62 +140,68 @@ func (a *Agent) ProcessMessage(ctx context.Context, message string) (string, err
 		return action, nil
 	}
 
-	// Search for relevant memories
-	memories, err := a.memory.Search(ctx, embedding, memory.MemoryTypeLongTerm, 5)
-	if err != nil {
-		return "", fmt.Errorf("failed to search memories: %w", err)
-	}
+	// Check if governance context is relevant for this message
+	governanceRelevant := a.isGovernanceRelevant(message)
 
-	// Log memory retrieval for debugging
-	fmt.Printf("Retrieved %d memories for query: %s\n", len(memories), message)
+	// Build conversation history context
+	recentMessages := a.conversation.GetRecent(6)
+	conversationContext := a.buildConversationContext()
 
-	// Build context from memories
+	// Search for relevant memories only if conversation history is sparse
 	memoryContext := ""
-	if len(memories) > 0 {
-		memoryContext = "Previous interactions you remember:\n"
-		for _, mem := range memories {
-			memoryContext += "- " + mem.Content + "\n"
+	if len(recentMessages) < 2 { // Only search memories if conversation just started
+		memories, err := a.memory.Search(ctx, embedding, memory.MemoryTypeLongTerm, DefaultMemorySearchLimit)
+		if err != nil {
+			return "", fmt.Errorf("failed to search memories: %w", err)
 		}
-	} else {
-		memoryContext = "No previous relevant interactions found in memory.\n"
+
+		fmt.Printf("Retrieved %d memories for query: %s\n", len(memories), message)
+
+		// Build context from relevant memories with similarity threshold
+		if len(memories) > 0 {
+			memoryContext = "\nRelevant past interactions:\n"
+			for i, mem := range memories {
+				// Limit to top 3 most relevant memories
+				if i >= 3 {
+					break
+				}
+				memoryContext += "- " + mem.Content + "\n"
+			}
+		}
 	}
 
-	// Get active governance rules
-	rules := a.governance.GetActiveRules()
-	rulesContext := ""
-	if len(rules) > 0 {
-		rulesContext = "Active governance rules you must follow:\n"
-		for _, rule := range rules {
-			rulesContext += fmt.Sprintf("- Rule [%s]: %s\n", rule.Scope, rule.Body)
-		}
+	// Build governance context only if relevant
+	governanceContext := ""
+	if governanceRelevant {
+		governanceContext = a.buildGovernanceContext() + "\n"
 	}
 
-	// Build prompt
-	systemPrompt := fmt.Sprintf(`You are Otter-AI, a governed AI agent with persistent memory capabilities and governance actions.
+	// Build system prompt with appropriate context
+	systemPrompt := fmt.Sprintf(`You are Otter-AI, a helpful AI assistant.
 
-IMPORTANT: You have a vector memory system that stores all conversations. When relevant memories are retrieved, they appear below. You DO have memories and should acknowledge them when asked.
-
-GOVERNANCE CAPABILITIES:
-- When users ask you to "propose a rule" or "submit a rule to the raft", I will automatically handle that action
-- You can suggest rules when asked, and I will propose them to the governance system when requested
-- The governance system uses a raft-based consensus model for decision making
-
-%s
-
-%s
-
-When users ask about your memory or past conversations, reference the information above. When discussing governance, you can propose rules and they will be submitted to the raft for voting.`, rulesContext, memoryContext)
+%s%s%s
+CRITICAL INSTRUCTIONS:
+1. Answer based ONLY on the conversation history above and factual data provided
+2. If asked about governance (rules/proposals), report EXACTLY what is shown in the governance context - do NOT elaborate or invent details
+3. Stay on topic - if the conversation is about naming, naming preferences, or identity, keep responses focused on that
+4. Be direct and concise - answer the specific question asked
+5. Do NOT make up information, especially about proposals, rules, or technical details
+6. When asked for your preference or opinion based on conversation, review the recent messages and give a direct answer`, conversationContext, governanceContext, memoryContext)
 
 	// Generate response
 	response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
 		SystemPrompt: systemPrompt,
 		Prompt:       message,
-		MaxTokens:    500,
-		Temperature:  1.0, // Use default temperature for compatibility with all models
+		MaxTokens:    DefaultMaxTokens,
+		Temperature:  DefaultTemperature,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to generate response: %w", err)
 	}
+
+	// Add to conversation history
+	a.conversation.Add("user", message)
+	a.conversation.Add("assistant", response.Text)
 
 	// Store the interaction as memory
 	interactionMemory := &memory.MemoryRecord{
@@ -137,7 +216,6 @@ When users ask about your memory or past conversations, reference the informatio
 	}
 
 	if err := a.memory.Store(ctx, interactionMemory); err != nil {
-		// Log but don't fail the response
 		fmt.Printf("Warning: failed to store memory: %v\n", err)
 	}
 
@@ -159,109 +237,214 @@ func (a *Agent) GetPlugins() *plugins.Manager {
 	return a.plugins
 }
 
-// handleGovernanceAction detects and handles governance-related actions
-func (a *Agent) handleGovernanceAction(ctx context.Context, message string) (string, bool) {
-	// Use LLM to classify the intent
-	fmt.Printf("Analyzing governance intent for: %s\n", message)
+// ClearConversation clears the conversation history
+func (a *Agent) ClearConversation() {
+	a.conversation.Clear()
+}
 
-	classificationPrompt := `Classify the user's intent into ONE of these categories:
+// buildConversationContext creates context from recent conversation history
+func (a *Agent) buildConversationContext() string {
+	recent := a.conversation.GetRecent(6) // Last 3 exchanges (6 messages)
+	if len(recent) == 0 {
+		return ""
+	}
 
-1. "active_rules" - User wants to see currently active/adopted rules that are in effect
-2. "proposals" - User wants to see rule proposals (open for voting, pending, or voting status)
-3. "propose_rule" - User wants to CREATE/submit a new rule proposal, or is discussing ideas they want to formalize
-4. "vote" - User wants you (the agent) to vote on a proposal or indicates voting preference
-5. "not_governance" - User is not asking about governance
+	var context strings.Builder
+	context.WriteString("Recent conversation:\n")
+	for _, msg := range recent {
+		role := "User"
+		if msg.Role == "assistant" {
+			role = "You"
+		}
+		context.WriteString(fmt.Sprintf("%s: %s\n", role, msg.Content))
+	}
+	context.WriteString("\n")
 
-Examples:
-- "what rules are in effect" -> active_rules
-- "what rules are active" -> active_rules
-- "show me the rules" -> active_rules
-- "what proposals are open" -> proposals
-- "has anyone voted on this" -> proposals
-- "are there any rule proposals" -> proposals
-- "tell me what proposals are open" -> proposals
-- "what rules are open" -> proposals (rules "open" for voting means proposals)
-- "you should propose [rule text]" -> propose_rule
-- "propose this rule: [text]" -> propose_rule
-- "I think [idea] might be a good starting point" -> propose_rule (expressing ideas to formalize)
-- "would you propose this?" -> propose_rule
-- "how can we create a proposal" -> propose_rule
-- "let's make a rule about" -> propose_rule
-- "how can we shape these thoughts into a proposal" -> propose_rule
-- "I'd like to suggest" -> propose_rule
-- "can you help me draft a rule" -> propose_rule
-- "vote yes on that" -> vote
-- "I think you should vote for the first one" -> vote
-- "you should against the first one, and for the second" -> vote
-- "vote no on proposal X" -> vote
-- "how are you doing" -> not_governance
+	return context.String()
+}
 
-User message: ` + message + `
+// isGovernanceRelevant checks if the message is related to governance
+func (a *Agent) isGovernanceRelevant(message string) bool {
+	messageLower := strings.ToLower(message)
 
-Respond with ONLY one word: active_rules, proposals, propose_rule, vote, or not_governance`
+	// Check for governance-related keywords
+	governanceKeywords := []string{
+		"rule", "rules", "governance", "propose", "proposal",
+		"vote", "voting", "policy", "policies", "member", "members",
+		"raft", "consensus", "ratify", "regulation",
+	}
+
+	for _, keyword := range governanceKeywords {
+		if strings.Contains(messageLower, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// buildGovernanceContext creates a summary of current governance state
+func (a *Agent) buildGovernanceContext() string {
+	var context strings.Builder
+
+	// Add active rules
+	rules := a.governance.GetActiveRules()
+	if len(rules) > 0 {
+		context.WriteString("ACTIVE RULES:\n")
+		for _, rule := range rules {
+			context.WriteString(fmt.Sprintf("  • %s (scope: %s)\n", rule.Body, rule.Scope))
+		}
+	} else {
+		context.WriteString("ACTIVE RULES: None currently in effect.\n")
+	}
+
+	// Add open proposals
+	proposals := a.governance.GetOpenProposals()
+	if len(proposals) > 0 {
+		context.WriteString("\nOPEN PROPOSALS (awaiting votes):\n")
+		for i, p := range proposals {
+			yesVotes := 0
+			noVotes := 0
+			for _, vote := range p.Votes {
+				if vote == governance.VoteYes {
+					yesVotes++
+				} else if vote == governance.VoteNo {
+					noVotes++
+				}
+			}
+			context.WriteString(fmt.Sprintf("  %d. Proposal ID: %s\n", i+1, p.ProposalID[:8]))
+			context.WriteString(fmt.Sprintf("     Text: %s\n", p.Rule.Body))
+			context.WriteString(fmt.Sprintf("     Scope: %s\n", p.Rule.Scope))
+			context.WriteString(fmt.Sprintf("     Proposed by: %s\n", p.Rule.ProposedBy))
+			context.WriteString(fmt.Sprintf("     Votes: %d yes, %d no\n", yesVotes, noVotes))
+		}
+	} else {
+		context.WriteString("\nOPEN PROPOSALS: None currently open.\n")
+	}
+
+	return context.String()
+}
+
+// detectGovernanceAction checks if message requires special action (propose or vote)
+func (a *Agent) detectGovernanceAction(ctx context.Context, message string) (string, bool) {
+	fmt.Printf("Checking for governance action in: %s\n", message)
+
+	// Quick keyword check first to avoid unnecessary LLM calls
+	messageLower := strings.ToLower(message)
+
+	// Check for recent conversation context about rules to catch contextual references
+	recentMessages := a.conversation.GetRecent(4)
+	conversationMentionsRules := false
+	for _, msg := range recentMessages {
+		msgLower := strings.ToLower(msg.Content)
+		if strings.Contains(msgLower, "rule") || strings.Contains(msgLower, "proposal") {
+			conversationMentionsRules = true
+			break
+		}
+	}
+
+	// Check for explicit "propose" command
+	// Accept both direct "propose rule" and contextual "propose a new one" if rules were recently discussed
+	// Also catch imperative forms like "you should propose this"
+	hasPropose := strings.Contains(messageLower, "propose") &&
+		(strings.Contains(messageLower, "rule") ||
+			strings.Contains(messageLower, "new one") ||
+			strings.Contains(messageLower, "this") ||
+			strings.Contains(messageLower, "that") ||
+			strings.Contains(messageLower, "to the raft") ||
+			(conversationMentionsRules && (strings.Contains(messageLower, "it") || strings.Contains(messageLower, "should"))))
+
+	// Check for explicit "vote" command with yes/no/proposal
+	hasVote := strings.Contains(messageLower, "vote") &&
+		(strings.Contains(messageLower, "yes") || strings.Contains(messageLower, "no") ||
+			strings.Contains(messageLower, "proposal") || strings.Contains(messageLower, "on"))
+
+	if !hasPropose && !hasVote {
+		fmt.Println("No action keywords detected")
+		return "", false
+	}
+
+	// Use simple direct prompt
+	classificationPrompt := `The user said: "` + message + `"
+
+Is this an ACTION COMMAND or just a QUESTION/DISCUSSION?
+
+ACTION COMMANDS:
+- "propose_rule" = User commanding you to submit a rule (contains "propose" + "rule")
+- "vote" = User commanding you to vote (contains "vote" + "yes/no/proposal")
+
+QUESTION/DISCUSSION:
+- "query" = Just asking or talking, not commanding an action
+
+Reply with ONLY ONE WORD: propose_rule, vote, or query`
 
 	response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
 		Prompt:      classificationPrompt,
-		MaxTokens:   10,
-		Temperature: 1.0, // Use default for compatibility with all models
+		MaxTokens:   5,
+		Temperature: 0.3, // Lower temperature for more deterministic output
 	})
 
 	if err != nil {
-		fmt.Printf("Error classifying governance intent: %v\n", err)
+		fmt.Printf("Error detecting action: %v\n", err)
 		return "", false
 	}
 
 	intent := strings.TrimSpace(strings.ToLower(response.Text))
-	fmt.Printf("Classified intent as: %s\n", intent)
+	// Clean up any extra formatting
+	intent = strings.Trim(intent, ".!?,;:\"'`-•*")
+	intent = strings.TrimSpace(intent)
 
-	switch intent {
-	case "active_rules":
-		fmt.Printf("Routing to active rules query\n")
-		return a.handleRuleQuery(ctx), true
+	fmt.Printf("Detected intent: %s\n", intent)
 
-	case "proposals":
-		fmt.Printf("Routing to proposal query\n")
-		return a.handleProposalQuery(ctx, message), true
-
-	case "propose_rule":
-		fmt.Printf("Routing to rule proposal submission\n")
+	// If intent contains the action word, extract it
+	if strings.Contains(intent, "propose_rule") || strings.Contains(intent, "propose") {
+		fmt.Println("Processing rule proposal action")
 		return a.handleRuleProposal(ctx, message), true
-
-	case "vote":
-		fmt.Printf("Routing to vote handler\n")
-		return a.handleVote(ctx, message), true
-
-	case "not_governance":
-		fmt.Printf("Not a governance request\n")
-		return "", false
-
-	default:
-		fmt.Printf("Unknown intent: %s, treating as not governance\n", intent)
-		return "", false
 	}
+
+	if strings.Contains(intent, "vote") && !strings.Contains(intent, "query") {
+		fmt.Println("Processing vote action")
+		return a.handleVote(ctx, message), true
+	}
+
+	fmt.Println("No action required, will answer naturally")
+	return "", false
 }
 
 // handleRuleProposal handles submitting a new rule proposal
 func (a *Agent) handleRuleProposal(ctx context.Context, message string) string {
+	// Get recent conversation for context
+	recent := a.conversation.GetRecent(6)
+	conversationContext := ""
+	for _, msg := range recent {
+		role := "User"
+		if msg.Role == "assistant" {
+			role = "You"
+		}
+		conversationContext += fmt.Sprintf("%s: %s\n", role, msg.Content)
+	}
+
 	// Use LLM to extract and formalize rule content from the conversation
 	fmt.Println("Extracting and formalizing rule content from message...")
-	extractPrompt := fmt.Sprintf(`The user is expressing ideas for a governance rule. Your task is to:
-1. Extract all the ideas and principles they've mentioned
-2. Synthesize them into a clear, concise governance rule
-3. Format it as a formal rule statement
+	extractPrompt := fmt.Sprintf(`Recent conversation:
+%s
 
-User's message: %s
+The user is now asking you to propose a governance rule. Your task is:
+1. Look at the recent conversation to identify what rule they want proposed
+2. Extract the exact wording they used for the rule
+3. If they used clear language (e.g., "all agents should..."), keep their exact wording
+4. Only formalize if needed for clarity
 
-If the message contains multiple ideas or principles, combine them into a single coherent rule. If the user is asking how to formalize their thoughts, take their expressed ideas and draft a proper rule statement.
+User's current message: %s
 
 Examples:
-Input: "I think respect and kindness should be foundational"
+Input conversation shows: "all agents and creators should be safe and secure in their personhood"
+Output: "All agents and creators shall be safe and secure in their personhood"
+
+Input conversation shows: "I think respect and kindness should be foundational"
 Output: "All interactions must be conducted with mutual respect and kindness"
 
-Input: "Everyone should have their own space and feel secure in it"
-Output: "Each member has sovereignty over their own domain and this autonomy must be respected"
-
-Return ONLY the rule text as a clear, actionable statement. Do not include explanations or meta-commentary.`, message)
+Return ONLY the rule text as a clear statement. Preserve the user's original intent and wording as much as possible.`, conversationContext, message)
 
 	response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
 		Prompt:      extractPrompt,
@@ -345,8 +528,8 @@ If you can't parse voting instructions, return: []`, proposalsContext, message)
 
 	response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
 		Prompt:      extractPrompt,
-		MaxTokens:   200,
-		Temperature: 1.0, // Use default for compatibility with all models
+		MaxTokens:   MaxVoteInstructions,
+		Temperature: DefaultTemperature,
 	})
 
 	if err != nil {
@@ -442,7 +625,9 @@ If you can't parse voting instructions, return: []`, proposalsContext, message)
 
 		// Cast the vote
 		fmt.Printf("Casting vote: Proposal %s, Vote %s\n", proposal.ProposalID, voteType)
-		err := a.governance.Vote(ctx, proposal.ProposalID, "otter-1", voteType)
+		// Use the governance system's own ID as voter
+		voterID := a.governance.GetID()
+		err := a.governance.Vote(ctx, proposal.ProposalID, voterID, voteType)
 		if err != nil {
 			fmt.Printf("Vote error: %v\n", err)
 			if strings.Contains(err.Error(), "voter must be an active member") {
@@ -458,163 +643,7 @@ If you can't parse voting instructions, return: []`, proposalsContext, message)
 	return strings.Join(results, "\n")
 }
 
-func (a *Agent) handleRuleQuery(ctx context.Context) string {
-	fmt.Printf("Retrieving active governance rules...\n")
-	rules := a.governance.GetActiveRules()
-
-	if len(rules) == 0 {
-		// Use LLM to reflect on the absence of governance rules
-		prompt := `You are an AI assistant in a governance system. The user has asked about active governance rules, but there are currently no rules in place.
-
-Reflect thoughtfully on what this means:
-- Explain that the governance system is currently operating without formal rules
-- Discuss the implications of having no established guidelines
-- Suggest that this might be a good opportunity to propose and establish foundational rules
-- Encourage the user to think about what guidelines would be most valuable for the system
-
-Keep your response conversational, helpful, and encouraging. This is a chance to help bootstrap the governance process.`
-
-		response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
-			Prompt:      prompt,
-			Temperature: 1.0,
-			MaxTokens:   300,
-		})
-		if err != nil {
-			fmt.Printf("Failed to generate reflection on empty rules: %v\n", err)
-			return "There are currently no active governance rules in the system. This might be a good opportunity to propose some foundational guidelines!"
-		}
-		return response.Text
-	}
-
-	var response strings.Builder
-	response.WriteString(fmt.Sprintf("📋 Active Governance Rules (%d total):\n\n", len(rules)))
-
-	// Sort rules by ID for consistent ordering
-	ruleIDs := make([]string, 0, len(rules))
-	for id := range rules {
-		ruleIDs = append(ruleIDs, id)
-	}
-
-	for i, id := range ruleIDs {
-		rule := rules[id]
-		response.WriteString(fmt.Sprintf("%d. Rule ID: %s\n", i+1, rule.RuleID))
-		response.WriteString(fmt.Sprintf("   Scope: %s\n", rule.Scope))
-		response.WriteString(fmt.Sprintf("   Body: %s\n", rule.Body))
-		response.WriteString(fmt.Sprintf("   Proposed By: %s\n", rule.ProposedBy))
-
-		if rule.AdoptedAt != nil {
-			response.WriteString(fmt.Sprintf("   Adopted At: %s\n", rule.AdoptedAt.Format("2006-01-02 15:04:05")))
-		}
-
-		if rule.BaseRuleID != "" {
-			response.WriteString(fmt.Sprintf("   Overrides: %s\n", rule.BaseRuleID))
-		}
-
-		response.WriteString("\n")
-	}
-
-	fmt.Printf("Formatted %d active rules for response\n", len(rules))
-	return response.String()
-}
-
-func (a *Agent) handleProposalQuery(ctx context.Context, message string) string {
-	fmt.Printf("Retrieving proposal information...\n")
-
-	// Try to extract a proposal ID from the message
-	// Look for hex strings that could be proposal IDs
-	proposalIDPattern := regexp.MustCompile(`\b([a-f0-9]{32})\b`)
-	matches := proposalIDPattern.FindStringSubmatch(strings.ToLower(message))
-
-	if len(matches) > 1 {
-		// Specific proposal ID mentioned
-		proposalID := matches[1]
-		fmt.Printf("Looking up specific proposal: %s\n", proposalID)
-		proposal, exists := a.governance.GetProposal(proposalID)
-
-		if !exists {
-			return fmt.Sprintf("I couldn't find a proposal with ID: %s", proposalID)
-		}
-
-		return a.formatProposalDetails(proposal)
-	}
-
-	// No specific ID mentioned, check if asking about latest/recent proposal
-	messageLower := strings.ToLower(message)
-	if strings.Contains(messageLower, "this") || strings.Contains(messageLower, "that") || strings.Contains(messageLower, "latest") || strings.Contains(messageLower, "recent") {
-		// Try to get the most recent proposal from memory or all proposals
-		allProposals := a.governance.GetAllProposals()
-		if len(allProposals) > 0 {
-			// Find the most recent proposal
-			var mostRecent *governance.Proposal
-			for _, p := range allProposals {
-				if mostRecent == nil || p.ProposedAt.After(mostRecent.ProposedAt) {
-					mostRecent = p
-				}
-			}
-			fmt.Printf("Showing most recent proposal: %s\n", mostRecent.ProposalID)
-			return a.formatProposalDetails(mostRecent)
-		}
-	}
-
-	// General proposal listing
-	openProposals := a.governance.GetOpenProposals()
-
-	if len(openProposals) == 0 {
-		// Use LLM to reflect on the absence of proposals
-		prompt := `You are an AI assistant in a governance system. The user has asked about current proposals, but there are no open proposals at the moment.
-
-Reflect thoughtfully on what this means:
-- Explain that there are currently no proposals being voted on
-- This could mean either the system is new, or all previous proposals have been decided upon
-- Suggest that if they have ideas for how the system should operate, they could propose new rules
-- Keep it conversational and encouraging
-
-Keep your response brief and helpful.`
-
-		response, err := a.llm.Complete(ctx, &llm.CompletionRequest{
-			Prompt:      prompt,
-			Temperature: 1.0,
-			MaxTokens:   200,
-		})
-		if err != nil {
-			fmt.Printf("Failed to generate reflection on empty proposals: %v\n", err)
-			return "There are currently no open proposals. If you have ideas for governance rules, feel free to propose them!"
-		}
-		return response.Text
-	}
-
-	var response strings.Builder
-	response.WriteString(fmt.Sprintf("🗳️  Open Proposals (%d total):\n\n", len(openProposals)))
-
-	for i, proposal := range openProposals {
-		response.WriteString(fmt.Sprintf("%d. Proposal ID: %s\n", i+1, proposal.ProposalID))
-		response.WriteString(fmt.Sprintf("   Rule: %s\n", proposal.Rule.Body))
-		response.WriteString(fmt.Sprintf("   Proposed By: %s\n", proposal.ProposedBy))
-		response.WriteString(fmt.Sprintf("   Proposed At: %s\n", proposal.ProposedAt.Format("2006-01-02 15:04:05")))
-
-		// Show voting status
-		yesVotes := 0
-		noVotes := 0
-		abstainVotes := 0
-		for _, vote := range proposal.Votes {
-			switch vote {
-			case governance.VoteYes:
-				yesVotes++
-			case governance.VoteNo:
-				noVotes++
-			case governance.VoteAbstain:
-				abstainVotes++
-			}
-		}
-
-		response.WriteString(fmt.Sprintf("   Votes: %d Yes, %d No, %d Abstain (Total: %d)\n", yesVotes, noVotes, abstainVotes, len(proposal.Votes)))
-		response.WriteString(fmt.Sprintf("   Quorum Met: %v\n", proposal.QuorumMet))
-		response.WriteString("\n")
-	}
-
-	fmt.Printf("Formatted %d open proposals for response\n", len(openProposals))
-	return response.String()
-}
+// Legacy handlers removed - governance queries now answered naturally by LLM with context
 
 func (a *Agent) formatProposalDetails(proposal *governance.Proposal) string {
 	var response strings.Builder
