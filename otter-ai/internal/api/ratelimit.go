@@ -2,7 +2,9 @@ package api
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -130,14 +132,36 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 func getClientIP(r *http.Request) string {
 	// Check X-Forwarded-For header (for proxies)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
+		// Use the first IP in the list
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			ip := strings.TrimSpace(parts[0])
+			if parsed := net.ParseIP(ip); parsed != nil {
+				return parsed.String()
+			}
+			if host, _, err := net.SplitHostPort(ip); err == nil {
+				return host
+			}
+			return ip
+		}
 	}
 
 	// Check X-Real-IP header (for proxies)
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+		ip := strings.TrimSpace(xri)
+		if parsed := net.ParseIP(ip); parsed != nil {
+			return parsed.String()
+		}
+		if host, _, err := net.SplitHostPort(ip); err == nil {
+			return host
+		}
+		return ip
 	}
 
 	// Use RemoteAddr as fallback
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+
 	return r.RemoteAddr
 }

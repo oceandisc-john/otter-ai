@@ -95,6 +95,10 @@ func main() {
 		log.Printf("Error shutting down server: %v", err)
 	}
 
+	if err := ag.Shutdown(ctx); err != nil {
+		log.Printf("Error shutting down agent: %v", err)
+	}
+
 	if err := pluginMgr.UnloadAll(ctx); err != nil {
 		log.Printf("Error shutting down plugins: %v", err)
 	}

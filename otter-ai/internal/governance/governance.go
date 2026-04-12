@@ -1,13 +1,19 @@
 package governance
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"otter-ai/internal/llm"
 	"otter-ai/internal/memory"
 )
 
@@ -20,6 +26,9 @@ const (
 	MinimumVotingMembers    = 2
 	UnanimousVotingMembers  = 2
 	SoloRaftAutoAdopt       = 1
+	GovernanceHTTPTimeout   = 15 * time.Second
+	NegotiationVoteTimeout  = 30 * time.Second
+	NegotiationPollInterval = 500 * time.Millisecond
 )
 
 // Governance system implementing Raft-based governance model
@@ -141,17 +150,18 @@ type Proposal struct {
 
 // Negotiation represents an inter-raft rule negotiation
 type Negotiation struct {
-	NegotiationID string
-	Raft1ID       string
-	Raft2ID       string
-	Conflicts     []*RuleConflict
-	ProposedRule  *Rule     // The negotiated compromise rule
-	Raft1Proposal *Proposal // Proposal in raft 1
-	Raft2Proposal *Proposal // Proposal in raft 2
-	Status        NegotiationStatus
-	StartedAt     time.Time
-	CompletedAt   *time.Time
-	LLMTranscript []string // Record of LLM negotiation
+	NegotiationID  string
+	Raft1ID        string
+	Raft2ID        string
+	TargetEndpoint string
+	Conflicts      []*RuleConflict
+	ProposedRule   *Rule     // The negotiated compromise rule
+	Raft1Proposal  *Proposal // Proposal in raft 1
+	Raft2Proposal  *Proposal // Proposal in raft 2
+	Status         NegotiationStatus
+	StartedAt      time.Time
+	CompletedAt    *time.Time
+	LLMTranscript  []string // Record of LLM negotiation
 }
 
 // NegotiationStatus defines negotiation state
@@ -337,8 +347,16 @@ func (g *Governance) ProposeRule(ctx context.Context, raftID string, rule *Rule)
 		return nil, fmt.Errorf("proposer must be an active member of raft %s", raftID)
 	}
 
+	if rule.Timestamp.IsZero() {
+		rule.Timestamp = time.Now()
+	}
+
 	// Set raft ID on rule
 	rule.RaftID = raftID
+
+	if rule.RuleID == "" {
+		rule.RuleID = generateID(rule)
+	}
 
 	// Generate proposal ID
 	proposalID := generateID(rule)
@@ -654,7 +672,7 @@ func (g *Governance) JoinRaft(ctx context.Context, targetRaftID string, targetOt
 	}
 
 	// Step 4: If conflicts exist, initiate LLM negotiation
-	negotiation, err := g.startNegotiation(ctx, targetRaftID, conflicts, llmProvider)
+	negotiation, err := g.startNegotiation(ctx, targetRaftID, targetOtterEndpoint, conflicts, llmProvider)
 	if err != nil {
 		return fmt.Errorf("negotiation initiation failed: %w", err)
 	}
@@ -724,14 +742,73 @@ func (g *Governance) adoptRulesAndJoin(ctx context.Context, targetRaftID string,
 		fmt.Printf("Warning: Failed to persist raft %s: %v\n", targetRaftID, err)
 	}
 
-	// Request membership from target raft
-	// In a real implementation, this would be an HTTP/gRPC call
-	// For now, we'll leave it as a placeholder
+	// Request membership from target raft via API.
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return fmt.Errorf("target endpoint is required for join request")
+	}
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		endpoint = "http://" + endpoint
+	}
+
+	joinReq := map[string]string{
+		"raft_id":      targetRaftID,
+		"requester_id": g.config.ID,
+		"public_key":   hex.EncodeToString(g.crypto.GetPublicKey()),
+	}
+	body, err := json.Marshal(joinReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal join request: %w", err)
+	}
+
+	url := strings.TrimRight(endpoint, "/") + "/api/v1/governance/join"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create join request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: GovernanceHTTPTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send join request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read join response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Roll back local membership when remote induction fails.
+		g.rafts.mu.Lock()
+		delete(g.rafts.rafts, targetRaftID)
+		g.rafts.mu.Unlock()
+		return fmt.Errorf("join request rejected (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	// Reflect self as active local member in this raft after successful induction.
+	raft.mu.Lock()
+	raft.Members[g.config.ID] = &Member{
+		ID:         g.config.ID,
+		State:      StateActive,
+		JoinedAt:   time.Now(),
+		LastSeenAt: time.Now(),
+		PublicKey:  g.crypto.GetPublicKey(),
+		InductedBy: targetRaftID,
+	}
+	raft.mu.Unlock()
+
+	if err := g.saveRaft(ctx, raft); err != nil {
+		fmt.Printf("Warning: Failed to persist inducted raft membership %s: %v\n", targetRaftID, err)
+	}
+
 	return nil
 }
 
 // startNegotiation initiates LLM-based negotiation between conflicting rafts
-func (g *Governance) startNegotiation(ctx context.Context, targetRaftID string, conflicts []*RuleConflict, llmProvider interface{}) (*Negotiation, error) {
+func (g *Governance) startNegotiation(ctx context.Context, targetRaftID string, targetEndpoint string, conflicts []*RuleConflict, llmProvider interface{}) (*Negotiation, error) {
 	if len(conflicts) == 0 {
 		return nil, fmt.Errorf("no conflicts to negotiate")
 	}
@@ -739,13 +816,14 @@ func (g *Governance) startNegotiation(ctx context.Context, targetRaftID string, 
 	negotiationID := generateID(fmt.Sprintf("negotiation-%s-%d", targetRaftID, time.Now().Unix()))
 
 	negotiation := &Negotiation{
-		NegotiationID: negotiationID,
-		Raft1ID:       conflicts[0].Raft1ID, // Primary conflict source
-		Raft2ID:       targetRaftID,
-		Conflicts:     conflicts,
-		Status:        NegotiationInProgress,
-		StartedAt:     time.Now(),
-		LLMTranscript: make([]string, 0),
+		NegotiationID:  negotiationID,
+		Raft1ID:        conflicts[0].Raft1ID, // Primary conflict source
+		Raft2ID:        targetRaftID,
+		TargetEndpoint: strings.TrimSpace(targetEndpoint),
+		Conflicts:      conflicts,
+		Status:         NegotiationInProgress,
+		StartedAt:      time.Now(),
+		LLMTranscript:  make([]string, 0),
 	}
 
 	g.negotiations.mu.Lock()
@@ -775,17 +853,43 @@ func (g *Governance) negotiateWithLLM(ctx context.Context, negotiation *Negotiat
 	// Record the prompt in the transcript
 	negotiation.LLMTranscript = append(negotiation.LLMTranscript, prompt)
 
-	// This would use the actual LLM provider
-	// For now, returning a placeholder
-	// In real implementation: use llmProvider.Complete(ctx, &CompletionRequest{Prompt: prompt, ...})
+	scope := negotiation.Conflicts[0].ConflictScope
+	body := ""
+
+	if provider, ok := llmProvider.(interface {
+		Complete(context.Context, *llm.CompletionRequest) (*llm.CompletionResponse, error)
+	}); ok {
+		resp, err := provider.Complete(ctx, &llm.CompletionRequest{
+			Prompt:      fmt.Sprintf("%s\n\nReturn ONLY JSON in this shape: {\"scope\":\"...\",\"body\":\"...\"}", prompt),
+			MaxTokens:   400,
+			Temperature: 0.2,
+		})
+		if err == nil && resp != nil {
+			negotiation.LLMTranscript = append(negotiation.LLMTranscript, resp.Text)
+			if parsedScope, parsedBody := parseNegotiatedRuleResponse(resp.Text, scope); parsedBody != "" {
+				scope = parsedScope
+				body = parsedBody
+			}
+		}
+	}
+
+	if body == "" {
+		body = synthesizeCompromiseRuleBody(negotiation.Conflicts)
+	}
+
+	proposedBy := g.pickActiveMemberID(negotiation.Raft1ID)
+	if proposedBy == "" {
+		proposedBy = g.config.ID
+	}
 
 	compromiseRule := &Rule{
-		RuleID:     generateID(fmt.Sprintf("compromise-%s", negotiation.NegotiationID)),
-		Scope:      negotiation.Conflicts[0].ConflictScope,
-		Version:    1,
+		RuleID:     generateID(fmt.Sprintf("compromise-%s-%s", negotiation.NegotiationID, negotiation.Raft1ID)),
+		RaftID:     negotiation.Raft1ID,
+		Scope:      scope,
+		Version:    maxConflictVersion(negotiation.Conflicts) + 1,
 		Timestamp:  time.Now(),
-		Body:       "# Negotiated compromise rule\n# (LLM-generated)", // Placeholder
-		ProposedBy: "llm-negotiation",
+		Body:       body,
+		ProposedBy: proposedBy,
 	}
 
 	return compromiseRule, nil
@@ -818,16 +922,30 @@ The proposal should be clear, actionable, and acceptable to all members of both 
 }
 
 // executeDualRaftVote proposes the negotiated rule to both rafts and waits for votes
-func (g *Governance) executeDualRaftVote(ctx context.Context, negotiation *Negotiation, llmProvider interface{}) error {
-	// Create proposals in both rafts
-	proposal1, err := g.ProposeRule(ctx, negotiation.Raft1ID, negotiation.ProposedRule)
+func (g *Governance) executeDualRaftVote(ctx context.Context, negotiation *Negotiation, _ interface{}) error {
+	proposer1 := g.pickActiveMemberID(negotiation.Raft1ID)
+	proposer2 := g.pickActiveMemberID(negotiation.Raft2ID)
+	if proposer1 == "" || proposer2 == "" {
+		return fmt.Errorf("cannot execute dual-raft vote: both rafts must have at least one active member")
+	}
+
+	// Create independent rule instances so each raft owns its own rule ID.
+	rule1 := *negotiation.ProposedRule
+	rule1.RaftID = negotiation.Raft1ID
+	rule1.ProposedBy = proposer1
+	rule1.RuleID = generateID(fmt.Sprintf("%s|%s|%s", negotiation.Raft1ID, rule1.Scope, rule1.Body))
+
+	rule2 := *negotiation.ProposedRule
+	rule2.RaftID = negotiation.Raft2ID
+	rule2.ProposedBy = proposer2
+	rule2.RuleID = generateID(fmt.Sprintf("%s|%s|%s", negotiation.Raft2ID, rule2.Scope, rule2.Body))
+
+	proposal1, err := g.ProposeRule(ctx, negotiation.Raft1ID, &rule1)
 	if err != nil {
 		return fmt.Errorf("failed to propose to raft 1: %w", err)
 	}
 
-	proposal2Rule := *negotiation.ProposedRule
-	proposal2Rule.RaftID = negotiation.Raft2ID
-	proposal2, err := g.ProposeRule(ctx, negotiation.Raft2ID, &proposal2Rule)
+	proposal2, err := g.ProposeRule(ctx, negotiation.Raft2ID, &rule2)
 	if err != nil {
 		return fmt.Errorf("failed to propose to raft 2: %w", err)
 	}
@@ -835,25 +953,209 @@ func (g *Governance) executeDualRaftVote(ctx context.Context, negotiation *Negot
 	negotiation.Raft1Proposal = proposal1
 	negotiation.Raft2Proposal = proposal2
 
-	// TODO: In a real implementation, this should:
-	// 1. Wait for both proposals to complete voting
-	// 2. Check if both rafts adopted the rule (proposal1.Result == ResultAdopted && proposal2.Result == ResultAdopted)
-	// 3. If both adopted: finalize raft peering
-	// 4. If either rejected: return error and clean up
-	// For now, returning nil as placeholder - this means the join will appear successful
-	// even though votes haven't been cast yet
+	// Cast initial YES votes from the local active members we selected as proposers.
+	_ = g.Vote(ctx, proposal1.ProposalID, proposer1, VoteYes)
+	_ = g.Vote(ctx, proposal2.ProposalID, proposer2, VoteYes)
 
-	return nil
+	ticker := time.NewTicker(NegotiationPollInterval)
+	defer ticker.Stop()
+	deadline := time.NewTimer(NegotiationVoteTimeout)
+	defer deadline.Stop()
+
+	for {
+		latest1, ok1 := g.GetProposal(proposal1.ProposalID)
+		latest2, ok2 := g.GetProposal(proposal2.ProposalID)
+		if !ok1 || !ok2 {
+			return fmt.Errorf("negotiation proposals missing while awaiting outcome")
+		}
+
+		if latest1.Status == ProposalClosed && latest2.Status == ProposalClosed {
+			if latest1.Result == ResultAdopted && latest2.Result == ResultAdopted {
+				return nil
+			}
+			return fmt.Errorf("negotiation vote failed: raft1=%s raft2=%s", latest1.Result, latest2.Result)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("negotiation vote canceled: %w", ctx.Err())
+		case <-deadline.C:
+			return fmt.Errorf("negotiation vote timed out waiting for both rafts to close proposals")
+		case <-ticker.C:
+		}
+	}
 }
 
 // fetchRaftRules fetches all rules from a remote raft
 // In a real implementation, this would make an HTTP/gRPC call
 func (g *Governance) fetchRaftRules(ctx context.Context, endpoint string, raftID string) (map[string]*Rule, error) {
-	// Placeholder - in real implementation:
-	// 1. Make HTTP GET to endpoint/api/v1/rafts/{raftID}/rules
-	// 2. Parse response into map[string]*Rule
-	// 3. Return rules
-	return make(map[string]*Rule), nil
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return nil, fmt.Errorf("target endpoint is required")
+	}
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		endpoint = "http://" + endpoint
+	}
+
+	url := strings.TrimRight(endpoint, "/") + "/api/v1/governance/rules"
+	client := &http.Client{Timeout: GovernanceHTTPTimeout}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed creating request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed fetching raft rules from %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading rules response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("rules endpoint returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	rules := make(map[string]*Rule)
+
+	var byScope map[string]*Rule
+	if err := json.Unmarshal(body, &byScope); err == nil && len(byScope) > 0 {
+		now := time.Now()
+		for scope, rule := range byScope {
+			if rule == nil {
+				continue
+			}
+			if rule.Scope == "" {
+				rule.Scope = scope
+			}
+			if rule.RaftID == "" {
+				rule.RaftID = raftID
+			}
+			if rule.Timestamp.IsZero() {
+				rule.Timestamp = now
+			}
+			if rule.Version == 0 {
+				rule.Version = 1
+			}
+			if rule.RuleID == "" {
+				rule.RuleID = generateID(fmt.Sprintf("%s|%s|%s", raftID, rule.Scope, rule.Body))
+			}
+			rules[rule.RuleID] = rule
+		}
+		return rules, nil
+	}
+
+	var asList []*Rule
+	if err := json.Unmarshal(body, &asList); err == nil && len(asList) > 0 {
+		now := time.Now()
+		for _, rule := range asList {
+			if rule == nil {
+				continue
+			}
+			if rule.RaftID == "" {
+				rule.RaftID = raftID
+			}
+			if rule.Timestamp.IsZero() {
+				rule.Timestamp = now
+			}
+			if rule.Version == 0 {
+				rule.Version = 1
+			}
+			if rule.RuleID == "" {
+				rule.RuleID = generateID(fmt.Sprintf("%s|%s|%s", raftID, rule.Scope, rule.Body))
+			}
+			rules[rule.RuleID] = rule
+		}
+		return rules, nil
+	}
+
+	return nil, fmt.Errorf("unable to parse rules response from %s", url)
+}
+
+func parseNegotiatedRuleResponse(raw string, defaultScope string) (string, string) {
+	clean := strings.TrimSpace(raw)
+	clean = strings.TrimPrefix(clean, "```json")
+	clean = strings.TrimPrefix(clean, "```")
+	clean = strings.TrimSuffix(clean, "```")
+	clean = strings.TrimSpace(clean)
+
+	var parsed struct {
+		Scope string `json:"scope"`
+		Body  string `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(clean), &parsed); err == nil {
+		scope := strings.TrimSpace(parsed.Scope)
+		if scope == "" {
+			scope = defaultScope
+		}
+		return scope, strings.TrimSpace(parsed.Body)
+	}
+
+	if clean == "" {
+		return defaultScope, ""
+	}
+	return defaultScope, clean
+}
+
+func synthesizeCompromiseRuleBody(conflicts []*RuleConflict) string {
+	if len(conflicts) == 0 {
+		return "Compromise rule: both rafts must explicitly approve a shared policy before it becomes active."
+	}
+
+	var lines []string
+	for _, c := range conflicts {
+		if c == nil || c.Rule1 == nil || c.Rule2 == nil {
+			continue
+		}
+		line := fmt.Sprintf("Scope %s compromise: evaluate policy using stricter requirement between '%s' and '%s'.", c.ConflictScope, strings.TrimSpace(c.Rule1.Body), strings.TrimSpace(c.Rule2.Body))
+		lines = append(lines, line)
+	}
+
+	if len(lines) == 0 {
+		return "Compromise rule: both rafts must explicitly approve a shared policy before it becomes active."
+	}
+	return strings.Join(lines, "\n")
+}
+
+func maxConflictVersion(conflicts []*RuleConflict) int {
+	maxVersion := 0
+	for _, c := range conflicts {
+		if c == nil {
+			continue
+		}
+		if c.Rule1 != nil && c.Rule1.Version > maxVersion {
+			maxVersion = c.Rule1.Version
+		}
+		if c.Rule2 != nil && c.Rule2.Version > maxVersion {
+			maxVersion = c.Rule2.Version
+		}
+	}
+	return maxVersion
+}
+
+func (g *Governance) pickActiveMemberID(raftID string) string {
+	g.rafts.mu.RLock()
+	raft, exists := g.rafts.rafts[raftID]
+	g.rafts.mu.RUnlock()
+	if !exists {
+		return ""
+	}
+
+	raft.mu.RLock()
+	defer raft.mu.RUnlock()
+
+	if member, ok := raft.Members[g.config.ID]; ok && member.State == StateActive {
+		return g.config.ID
+	}
+	for memberID, member := range raft.Members {
+		if member.State == StateActive {
+			return memberID
+		}
+	}
+	return ""
 }
 
 // GetPublicKey returns this otter's public key

@@ -32,10 +32,11 @@ type RaftConfig struct {
 
 // LLMConfig holds LLM provider configuration
 type LLMConfig struct {
-	Provider string
-	Endpoint string
-	Model    string
-	APIKey   string
+	Provider       string
+	Endpoint       string
+	Model          string
+	EmbeddingModel string
+	APIKey         string
 }
 
 // APIConfig holds API server configuration
@@ -69,23 +70,29 @@ func Load() (*Config, error) {
 	// Load .env file if it exists (development mode)
 	_ = godotenv.Load()
 
+	raftID, err := getEnvRequired("OTTER_RAFT_ID")
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Env:           getEnv("OTTER_ENV", "development"),
 		Port:          getEnvAsInt("OTTER_PORT", 8080),
 		DBPath:        getEnv("OTTER_DB_PATH", "/data/otter.db"),
 		VectorBackend: getEnv("OTTER_VECTOR_BACKEND", "sqlite"),
 		Raft: RaftConfig{
-			ID:            getEnvRequired("OTTER_RAFT_ID"),
+			ID:            raftID,
 			Type:          getEnv("OTTER_RAFT_TYPE", "raft"),
 			BindAddr:      getEnv("OTTER_RAFT_BIND_ADDR", "127.0.0.1:7000"),
 			AdvertiseAddr: getEnv("OTTER_RAFT_ADVERTISE_ADDR", "127.0.0.1:7000"),
 			DataDir:       getEnv("OTTER_RAFT_DATA_DIR", "/data/raft"),
 		},
 		LLM: LLMConfig{
-			Provider: getEnv("OTTER_LLM_PROVIDER", "openwebui"),
-			Endpoint: getEnv("OTTER_LLM_ENDPOINT", "http://localhost:11434"),
-			Model:    getEnv("OTTER_LLM_MODEL", "llama2"),
-			APIKey:   getEnv("OTTER_LLM_API_KEY", ""),
+			Provider:       getEnv("OTTER_LLM_PROVIDER", "openwebui"),
+			Endpoint:       getEnv("OTTER_LLM_ENDPOINT", "http://localhost:11434"),
+			Model:          getEnv("OTTER_LLM_MODEL", "llama2"),
+			EmbeddingModel: getEnv("OTTER_LLM_EMBEDDING_MODEL", ""),
+			APIKey:         getEnv("OTTER_LLM_API_KEY", ""),
 		},
 		API: APIConfig{
 			Port:            getEnvAsInt("OTTER_PORT", 8080),
@@ -131,12 +138,12 @@ func getEnv(key, defaultValue string) string {
 }
 
 // getEnvRequired retrieves a required environment variable or fails
-func getEnvRequired(key string) string {
+func getEnvRequired(key string) (string, error) {
 	value := os.Getenv(key)
 	if value == "" {
-		panic(fmt.Sprintf("Required environment variable %s is not set", key))
+		return "", fmt.Errorf("required environment variable %s is not set", key)
 	}
-	return value
+	return value, nil
 }
 
 // getEnvAsInt retrieves an environment variable as an integer or returns a default value

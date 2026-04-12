@@ -9,9 +9,29 @@ const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    // Check if user is already authenticated
-    setIsAuthenticated(otterService.isAuthenticated());
-    setIsLoading(false);
+    let isMounted = true;
+
+    const initAuth = async () => {
+      if (otterService.isAuthenticated()) {
+        if (isMounted) {
+          setIsAuthenticated(true);
+          setIsLoading(false);
+        }
+        return;
+      }
+
+      const ok = await otterService.bootstrapAuth();
+      if (isMounted) {
+        setIsAuthenticated(ok);
+        setIsLoading(false);
+      }
+    };
+
+    initAuth();
+
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   const handleLogin = () => {

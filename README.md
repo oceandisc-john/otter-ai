@@ -130,7 +130,7 @@ Optional security configuration:
 ## API Endpoints
 
 ### Authentication
-- `POST /auth` - Authenticate with passphrase (if `OTTER_HOST_PASSPHRASE` is configured)
+- `POST /api/v1/auth` - Authenticate with passphrase (if `OTTER_HOST_PASSPHRASE` is configured)
   - Request: `{"passphrase": "your-passphrase"}`
   - Response: `{"token": "jwt-token", "expiresAt": "2024-01-01T00:00:00Z"}`
   - Use the token in subsequent requests: `Authorization: Bearer <token>`

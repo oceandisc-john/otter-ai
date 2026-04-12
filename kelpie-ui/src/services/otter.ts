@@ -26,9 +26,20 @@ api.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      // Clear invalid token and redirect to login
-      localStorage.removeItem(AUTH_TOKEN_KEY);
-      window.location.reload();
+      const requestUrl = String(error.config?.url || '');
+      const isAuthEndpoint = requestUrl.includes('/api/v1/auth');
+      const hadToken = !!localStorage.getItem(AUTH_TOKEN_KEY);
+
+      // Always clear stale tokens on 401.
+      if (hadToken) {
+        localStorage.removeItem(AUTH_TOKEN_KEY);
+      }
+
+      // Only force reload when a non-auth request with an existing token is rejected.
+      // This avoids infinite reload loops when bootstrap/login receives expected 401 responses.
+      if (hadToken && !isAuthEndpoint) {
+        window.location.reload();
+      }
     }
     return Promise.reject(error);
   }
@@ -67,14 +78,33 @@ export interface Proposal {
 }
 
 export const otterService = {
+  // Bootstrap auth for instances with no passphrase
+  async bootstrapAuth(): Promise<boolean> {
+    try {
+      const response = await api.post('/api/v1/auth', { passphrase: '' });
+      if (response.data.authenticated) {
+        const token = response.data.token;
+        if (token) {
+          localStorage.setItem(AUTH_TOKEN_KEY, token);
+        } else {
+          localStorage.removeItem(AUTH_TOKEN_KEY);
+        }
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  },
   // Authentication
   async authenticate(passphrase: string): Promise<boolean> {
     try {
       const response = await api.post('/api/v1/auth', { passphrase });
       if (response.data.authenticated) {
-        // Store JWT token instead of passphrase
-        const token = response.data.token || passphrase; // Fallback for backward compatibility
-        localStorage.setItem(AUTH_TOKEN_KEY, token);
+        const token = response.data.token;
+        if (token) {
+          localStorage.setItem(AUTH_TOKEN_KEY, token);
+        }
         return true;
       }
       return false;

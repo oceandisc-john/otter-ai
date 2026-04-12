@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -35,6 +36,11 @@ func NewOllamaProvider(cfg config.LLMConfig) (*OllamaProvider, error) {
 
 // Complete generates a completion
 func (p *OllamaProvider) Complete(ctx context.Context, request *CompletionRequest) (*CompletionResponse, error) {
+	// When tools are provided, use the chat API which supports function calling.
+	if len(request.Tools) > 0 {
+		return p.completeWithTools(ctx, request)
+	}
+
 	prompt := request.Prompt
 	if request.SystemPrompt != "" {
 		prompt = request.SystemPrompt + "\n\n" + prompt
@@ -103,6 +109,83 @@ func (p *OllamaProvider) Complete(ctx context.Context, request *CompletionReques
 	}, nil
 }
 
+// completeWithTools uses Ollama's chat API with tool definitions.
+func (p *OllamaProvider) completeWithTools(ctx context.Context, request *CompletionRequest) (*CompletionResponse, error) {
+	messages := []map[string]string{}
+	if request.SystemPrompt != "" {
+		messages = append(messages, map[string]string{
+			"role":    "system",
+			"content": request.SystemPrompt,
+		})
+	}
+	messages = append(messages, map[string]string{
+		"role":    "user",
+		"content": request.Prompt,
+	})
+
+	reqBody := map[string]interface{}{
+		"model":    p.model,
+		"messages": messages,
+		"stream":   false,
+		"tools":    buildOpenAITools(request.Tools),
+	}
+
+	options := map[string]interface{}{}
+	if request.MaxTokens > 0 {
+		options["num_predict"] = request.MaxTokens
+	}
+	if request.Temperature > 0 {
+		options["temperature"] = request.Temperature
+	}
+	if len(options) > 0 {
+		reqBody["options"] = options
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.endpoint+"/api/chat", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Ollama API error: %s", string(body))
+	}
+
+	var result struct {
+		Message struct {
+			Content   string               `json:"content"`
+			ToolCalls []openAIToolCallJSON `json:"tool_calls"`
+		} `json:"message"`
+		Done bool `json:"done"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &CompletionResponse{
+		Text:         result.Message.Content,
+		FinishReason: "stop",
+		ToolCalls:    parseOpenAIToolCalls(result.Message.ToolCalls),
+	}, nil
+}
+
 // Embed generates embeddings
 func (p *OllamaProvider) Embed(ctx context.Context, text string) ([]float32, error) {
 	reqBody := map[string]interface{}{
@@ -154,25 +237,43 @@ func (p *OllamaProvider) Name() string {
 
 // OpenWebUIProvider implements OpenWebUI's OpenAI-compatible API
 type OpenWebUIProvider struct {
-	endpoint string
-	model    string
-	apiKey   string
-	client   *http.Client
+	endpoint       string
+	model          string
+	embeddingModel string
+	apiKey         string
+	client         *http.Client
 }
 
 // NewOpenWebUIProvider creates a new OpenWebUI provider
 // OpenWebUI uses OpenAI-compatible API paths (/v1/*) not Ollama paths (/api/*)
 func NewOpenWebUIProvider(cfg config.LLMConfig) (*OpenWebUIProvider, error) {
+	embModel := cfg.EmbeddingModel
+	if embModel == "" {
+		embModel = cfg.Model
+	}
 	return &OpenWebUIProvider{
-		endpoint: cfg.Endpoint,
-		model:    cfg.Model,
-		apiKey:   cfg.APIKey,
-		client:   &http.Client{Timeout: LLMClientTimeout},
+		endpoint:       cfg.Endpoint,
+		model:          cfg.Model,
+		embeddingModel: embModel,
+		apiKey:         cfg.APIKey,
+		client:         &http.Client{Timeout: LLMClientTimeout},
 	}, nil
 }
 
-// Complete generates a completion using OpenWebUI's OpenAI-compatible chat API
+// Complete generates a completion using OpenWebUI's OpenAI-compatible chat API.
+// If tools are provided but the model returns an empty response, the request is
+// automatically retried without tools so the agent can still function.
 func (p *OpenWebUIProvider) Complete(ctx context.Context, request *CompletionRequest) (*CompletionResponse, error) {
+	resp, err := p.doComplete(ctx, request, true)
+	if err != nil && len(request.Tools) > 0 && resp == nil {
+		// Retry without tools — the model may not support function calling.
+		fmt.Println("OpenWebUI: retrying without tools")
+		return p.doComplete(ctx, request, false)
+	}
+	return resp, err
+}
+
+func (p *OpenWebUIProvider) doComplete(ctx context.Context, request *CompletionRequest, includeTool bool) (*CompletionResponse, error) {
 	messages := []map[string]string{}
 
 	if request.SystemPrompt != "" {
@@ -202,6 +303,12 @@ func (p *OpenWebUIProvider) Complete(ctx context.Context, request *CompletionReq
 
 	if len(request.StopTokens) > 0 {
 		reqBody["stop"] = request.StopTokens
+	}
+
+	if includeTool {
+		if tools := buildOpenAITools(request.Tools); tools != nil {
+			reqBody["tools"] = tools
+		}
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -236,7 +343,8 @@ func (p *OpenWebUIProvider) Complete(ctx context.Context, request *CompletionReq
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string               `json:"content"`
+				ToolCalls []openAIToolCallJSON `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -250,6 +358,7 @@ func (p *OpenWebUIProvider) Complete(ctx context.Context, request *CompletionReq
 	}
 
 	if len(result.Choices) == 0 {
+		fmt.Printf("OpenWebUI returned 0 choices. Raw response: %s\n", string(body))
 		return nil, fmt.Errorf("no response from OpenWebUI")
 	}
 
@@ -257,13 +366,14 @@ func (p *OpenWebUIProvider) Complete(ctx context.Context, request *CompletionReq
 		Text:         result.Choices[0].Message.Content,
 		TokensUsed:   result.Usage.TotalTokens,
 		FinishReason: result.Choices[0].FinishReason,
+		ToolCalls:    parseOpenAIToolCalls(result.Choices[0].Message.ToolCalls),
 	}, nil
 }
 
 // Embed generates embeddings using OpenWebUI's OpenAI-compatible embeddings API
 func (p *OpenWebUIProvider) Embed(ctx context.Context, text string) ([]float32, error) {
 	reqBody := map[string]interface{}{
-		"model": p.model,
+		"model": p.embeddingModel,
 		"input": text,
 	}
 
@@ -272,7 +382,10 @@ func (p *OpenWebUIProvider) Embed(ctx context.Context, text string) ([]float32, 
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.endpoint+"/api/embeddings", bytes.NewBuffer(jsonData))
+	url := p.endpoint + "/api/embeddings"
+	log.Printf("[DEBUG] Embed request: url=%s model=%s input_len=%d", url, p.embeddingModel, len(text))
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -291,6 +404,8 @@ func (p *OpenWebUIProvider) Embed(ctx context.Context, text string) ([]float32, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
+
+	log.Printf("[DEBUG] Embed response: status=%d body_len=%d body=%s", resp.StatusCode, len(body), string(body))
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("OpenWebUI API error (status %d): %s", resp.StatusCode, string(body))
@@ -378,6 +493,10 @@ func (p *OpenAIProvider) Complete(ctx context.Context, request *CompletionReques
 		reqBody["stop"] = request.StopTokens
 	}
 
+	if tools := buildOpenAITools(request.Tools); tools != nil {
+		reqBody["tools"] = tools
+	}
+
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -408,7 +527,8 @@ func (p *OpenAIProvider) Complete(ctx context.Context, request *CompletionReques
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string               `json:"content"`
+				ToolCalls []openAIToolCallJSON `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -429,6 +549,7 @@ func (p *OpenAIProvider) Complete(ctx context.Context, request *CompletionReques
 		Text:         result.Choices[0].Message.Content,
 		TokensUsed:   result.Usage.TotalTokens,
 		FinishReason: result.Choices[0].FinishReason,
+		ToolCalls:    parseOpenAIToolCalls(result.Choices[0].Message.ToolCalls),
 	}, nil
 }
 

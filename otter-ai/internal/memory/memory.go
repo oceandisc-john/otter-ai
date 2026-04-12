@@ -46,12 +46,12 @@ func New(vectorDB vectordb.VectorDB) *Memory {
 
 // Store stores a memory with its embedding
 func (m *Memory) Store(ctx context.Context, record *MemoryRecord) error {
-	if record.ID == "" {
-		record.ID = generateMemoryID(record)
-	}
-
 	if record.Timestamp.IsZero() {
 		record.Timestamp = time.Now()
+	}
+
+	if record.ID == "" {
+		record.ID = generateMemoryID(record)
 	}
 
 	table := m.getTableForType(record.Type)

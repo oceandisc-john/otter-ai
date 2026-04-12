@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -67,6 +68,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/v1/governance/rules", s.requireAuth(s.handleListRules))
 	mux.HandleFunc("POST /api/v1/governance/rules", s.requireAuth(s.handleProposeRule))
 	mux.HandleFunc("POST /api/v1/governance/vote", s.requireAuth(s.handleVote))
+	mux.HandleFunc("POST /api/v1/governance/join", s.requireAuth(s.handleJoinRaft))
 	mux.HandleFunc("GET /api/v1/governance/members", s.requireAuth(s.handleListMembers))
 
 	// Apply middleware chain: rate limiting -> CORS
@@ -249,6 +251,40 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 
 	respondJSON(w, http.StatusOK, map[string]string{
 		"status": "vote recorded",
+	})
+}
+
+// handleJoinRaft handles membership induction requests from peer otters.
+func (s *Server) handleJoinRaft(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RaftID      string `json:"raft_id"`
+		RequesterID string `json:"requester_id"`
+		PublicKey   string `json:"public_key"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.RaftID == "" || req.RequesterID == "" || req.PublicKey == "" {
+		respondError(w, http.StatusBadRequest, "raft_id, requester_id, and public_key are required")
+		return
+	}
+
+	publicKey, err := hex.DecodeString(req.PublicKey)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "public_key must be valid hex")
+		return
+	}
+
+	if err := s.agent.GetGovernance().RequestJoin(r.Context(), req.RaftID, req.RequesterID, publicKey); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"status": "join accepted",
 	})
 }
 
